@@ -22,11 +22,22 @@ import subprocess
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QObject, Property, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QMetaObject,
+    QObject,
+    Property,
+    QThread,
+    QTimer,
+    Qt,
+    Signal,
+    Slot,
+)
 
 from . import autostart as autostart_mod
+from . import mccs
 from .config import Config
 from .ddc import MonitorManager
+from .ddc.worker import DdcWorker
 from .display import (
     DisplayEffects,
     SessionType,
@@ -37,18 +48,6 @@ from .features.circadian import CircadianController
 from .features.reminders import ReminderContext, ReminderEngine
 from .features.report import ScreenTimeTracker
 from .features.timers import PhaseTimer, make_pomodoro, make_twenty
-
-#: Picture modes offered for VCP 0xDC (reverse engineered, see mccs.ColorMode).
-_PICTURE_MODES: tuple[tuple[int, str], ...] = (
-    (0x00, "Standard"),
-    (0x01, "Care Mode"),
-    (0x28, "Game"),
-    (0x32, "Cinema"),
-    (0x0F, "sRGB"),
-    (0x1F, "User"),
-    (0x1E, "M-Photo"),
-    (0x03, "Dynamic"),
-)
 
 
 class EyeCareCore(QObject):
@@ -67,6 +66,17 @@ class EyeCareCore(QObject):
     statusMessageChanged = Signal()
     configChanged = Signal()
     circadianChanged = Signal()
+
+    # Internal request signals.  The DDC worker lives on its own QThread, so
+    # these connections are queued automatically: emitting them from the GUI
+    # thread hands the work to the worker without blocking the interface.
+    _startDdc = Signal()
+    _refreshDdc = Signal(bool)
+    _setDdcInterval = Signal(int)
+    _requestBrightness = Signal(str, int)
+    _requestVolume = Signal(str, int)
+    _requestMute = Signal(str, bool)
+    _requestColorMode = Signal(str, int)
 
     def __init__(self, config: Config | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -116,12 +126,26 @@ class EyeCareCore(QObject):
         self._ui_timer.timeout.connect(self._tick)
         self._ui_timer.start()
 
-        # DDC polling loop.
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self.refreshMonitors)
+        # DDC/CI runs on a dedicated worker thread so the GUI never blocks on
+        # i2c traffic (the same split the Windows build uses; see
+        # eyecareu/ddc/worker.py).  The GUI thread only reads cached state.
+        self._ddc_thread = QThread(self)
+        self._ddc_thread.setObjectName("eyecareu-ddc")
+        self._worker = DdcWorker(self._manager)
+        self._worker.moveToThread(self._ddc_thread)
+        self._startDdc.connect(self._worker.start)
+        self._refreshDdc.connect(self._worker.refresh)
+        self._setDdcInterval.connect(self._worker.set_interval)
+        self._requestBrightness.connect(self._worker.set_brightness)
+        self._requestVolume.connect(self._worker.set_volume)
+        self._requestMute.connect(self._worker.set_mute)
+        self._requestColorMode.connect(self._worker.set_color_mode)
+        self._worker.changed.connect(self._on_ddc_changed)
+        self._worker.failed.connect(self._set_status)
+        self._ddc_thread.start()
         self._apply_poll_interval()
+        self._startDdc.emit()
 
-        self.refreshMonitors()
         self._apply_effects()
 
     # ------------------------------------------------------------------
@@ -144,9 +168,7 @@ class EyeCareCore(QObject):
             self._set_status(f"could not save settings: {exc}")
 
     def _apply_poll_interval(self) -> None:
-        interval = max(500, int(self._cfg.ddc.poll_interval_ms))
-        self._poll_timer.setInterval(interval)
-        self._poll_timer.start()
+        self._setDdcInterval.emit(max(500, int(self._cfg.ddc.poll_interval_ms)))
 
     # ------------------------------------------------------------------
     # session / backend (read-only)
@@ -200,6 +222,7 @@ class EyeCareCore(QObject):
                 "serial": identity.serial,
                 "firmware": state.firmware.current if state.firmware.supported else 0,
                 "capabilities": sorted(state.capabilities.capabilities),
+                "probed": state.probed,
                 "error": state.error,
                 "backlight": state.backlight,
             })
@@ -231,48 +254,58 @@ class EyeCareCore(QObject):
         entries = self.monitors
         return entries[0] if entries else {}
 
-    @Property("QVariantList", constant=True)
+    @Property("QVariantList", notify=monitorsChanged)
     def pictureModes(self) -> list:
-        return [{"value": value, "label": label} for value, label in _PICTURE_MODES]
+        """Picture modes the *selected* monitor advertises via VCP 0xDC.
+
+        The list comes from the panel's own capability string
+        (``vcp(... DC(00 03 0F 12 27 28) ...)``), so it shows exactly the modes
+        that model supports rather than a generic guess.  Each entry is
+        ``{"value": <int>, "label": <str>}``.
+        """
+        state = self._manager.monitor(self._selected)
+        if state is None or not state.probed:
+            # Still scanning: offering a guess here would just flicker.
+            return []
+        codes = list(state.color_modes) if state.color_modes else []
+        if not codes:
+            codes = list(mccs.DEFAULT_COLOR_MODES)
+        return [{"value": int(code), "label": mccs.color_mode_name(code)}
+                for code in codes]
 
     @Slot()
-    def refreshMonitors(self) -> None:
-        states = self._manager.refresh()
-        if states and not self._selected:
+    def _on_ddc_changed(self) -> None:
+        """Worker callback: cached state changed, refresh the UI bindings."""
+        states = self._manager.monitors()
+        if not states:
+            if self._selected:
+                self._selected = ""
+                self.selectedMonitorChanged.emit()
+        elif not self._selected or self._manager.monitor(self._selected) is None:
             self._selected = states[0].identity.display_id
-            self.selectedMonitorChanged.emit()
-        if self._selected and self._manager.monitor(self._selected) is None:
-            self._selected = states[0].identity.display_id if states else ""
             self.selectedMonitorChanged.emit()
         self.monitorsChanged.emit()
 
+    @Slot()
+    def refreshMonitors(self) -> None:
+        """Request a fresh scan; capability strings are re-read as well."""
+        self._refreshDdc.emit(True)
+
     @Slot(str, int)
     def setBrightness(self, display_id: str, percent: int) -> None:
-        if self._manager.set_brightness(display_id, percent):
-            self.monitorsChanged.emit()
-        else:
-            self._set_status("the monitor did not accept the brightness change")
+        self._requestBrightness.emit(display_id, int(percent))
 
     @Slot(str, int)
     def setVolume(self, display_id: str, percent: int) -> None:
-        if self._manager.set_volume(display_id, percent):
-            self.monitorsChanged.emit()
-        else:
-            self._set_status("the monitor did not accept the volume change")
+        self._requestVolume.emit(display_id, int(percent))
 
     @Slot(str, bool)
     def setMuted(self, display_id: str, muted: bool) -> None:
-        if self._manager.set_mute(display_id, muted):
-            self.monitorsChanged.emit()
-        else:
-            self._set_status("the monitor did not accept the mute change")
+        self._requestMute.emit(display_id, bool(muted))
 
     @Slot(str, int)
     def setColorMode(self, display_id: str, mode: int) -> None:
-        if self._manager.set_color_mode(display_id, mode):
-            self.monitorsChanged.emit()
-        else:
-            self._set_status("the monitor did not accept the picture mode change")
+        self._requestColorMode.emit(display_id, int(mode))
 
     # ------------------------------------------------------------------
     # software effects
@@ -902,11 +935,16 @@ class EyeCareCore(QObject):
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
         self._ui_timer.stop()
-        self._poll_timer.stop()
+        # Stop the DDC worker thread and let it close the backend on its own
+        # thread (BlockingQueuedConnection guarantees the slot has run).
+        if self._ddc_thread.isRunning():
+            QMetaObject.invokeMethod(self._worker, "shutdown",
+                                     Qt.BlockingQueuedConnection)
+            self._ddc_thread.quit()
+            self._ddc_thread.wait(3000)
         try:
             self._report.save(force=True)
         except OSError:
             pass
         self._flush_config()
         self._effects.close()
-        self._manager.close()

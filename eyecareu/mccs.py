@@ -82,38 +82,90 @@ VCP_NAMES: dict[int, str] = {
 
 
 class ColorMode(IntEnum):
-    """Picture modes for VCP 0xDC.
+    """Picture / colour modes for VCP 0xDC (BenQ enumeration).
 
-    Recovered from the embedded model schemas (``VCPTree`` documents in
-    ``Eye-CareU.exe``)::
+    Two independent sources were combined:
 
-        <VCPcode Type="Standard"  Category="Picture Mode" Code="0x00" SHCode="0x00"/>
-        <VCPcode Type="Cinema"    Category="Picture Mode" Code="0x32" SHCode="0x00"/>
-        <VCPcode Type="Game"      Category="Picture Mode" Code="0x28" SHCode="0x00"/>
-        <VCPcode Type="Care Mode" Category="Picture Mode" Code="0x01" SHCode="0x00"/>
+    * the embedded model schemas (``VCPTree`` documents in ``Eye-CareU.exe``)::
+
+          <VCPcode Type="Standard"  Category="Picture Mode" Code="0x00" SHCode="0x00"/>
+          <VCPcode Type="Cinema"    Category="Picture Mode" Code="0x32" SHCode="0x00"/>
+          <VCPcode Type="Game"      Category="Picture Mode" Code="0x28" SHCode="0x00"/>
+          <VCPcode Type="Care Mode" Category="Picture Mode" Code="0x01" SHCode="0x00"/>
+
+    * the values a BenQ panel publishes in its own capability string, e.g. the
+      GW2490 reports ``vcp(... DC(00 03 0F 12 27 28) ...)`` and its spec sheet
+      lists the modes *M-book, Standard, User, Game, ePaper, Care mode, Coding,
+      Cinema* — so ``0x27`` is Coding and ``0x03`` is the Cinema/Movie slot.
+
+    Video-input panels (retail BenQ TVs/monitors) use a partly different set
+    (sRGB ``0x0A``, ePaper ``0x1F``, HDR ``0x23``, Dark/Light theme ``0x30/0x31``);
+    those names are included so panels that advertise them get a real label.
     """
 
     STANDARD = 0x00
-    CINEMA = 0x32
-    GAME = 0x28
     CARE_MODE = 0x01
-    # MCCS-standard extras, offered when a monitor advertises them.
-    SRGB = 0x0F
-    USER = 0x1F
+    CINEMA_MOVIE = 0x03      # MCCS "Movie"; used by the GW-series Cinema mode
+    SRGB = 0x0A
+    M_BOOK = 0x0F
+    USER = 0x12
     M_PHOTO = 0x1E
-    DYNAMIC = 0x03
+    EPAPER = 0x1F
+    HDR = 0x23
+    CODING = 0x27
+    GAME = 0x28
+    DARK_THEME = 0x30
+    LIGHT_THEME = 0x31
+    CINEMA = 0x32
 
 
-COLOR_MODE_NAMES: dict[int, str] = {
+#: Human names for the VCP 0xDC values above.  A panel only ever exposes the
+#: subset it advertises in its capability string, so listing the union here is
+#: safe: unsupported entries are never offered.
+BENQ_COLOR_MODES: dict[int, str] = {
     ColorMode.STANDARD: "Standard",
-    ColorMode.CINEMA: "Cinema",
-    ColorMode.GAME: "Game",
     ColorMode.CARE_MODE: "Care Mode",
+    ColorMode.CINEMA_MOVIE: "Cinema",
     ColorMode.SRGB: "sRGB",
+    ColorMode.M_BOOK: "M-book",
     ColorMode.USER: "User",
     ColorMode.M_PHOTO: "M-Photo",
-    ColorMode.DYNAMIC: "Dynamic",
+    ColorMode.EPAPER: "ePaper",
+    ColorMode.HDR: "HDR",
+    ColorMode.CODING: "Coding",
+    ColorMode.GAME: "Game",
+    ColorMode.DARK_THEME: "Dark Theme",
+    ColorMode.LIGHT_THEME: "Light Theme",
+    ColorMode.CINEMA: "Cinema",
 }
+
+#: Retained for backwards compatibility with earlier revisions of this port.
+COLOR_MODE_NAMES = BENQ_COLOR_MODES
+
+#: Fallback presentation order, used only when a panel does not publish an
+#: explicit ``DC(...)`` value list in its capability string.
+DEFAULT_COLOR_MODES: tuple[int, ...] = (
+    ColorMode.STANDARD,
+    ColorMode.CINEMA_MOVIE,
+    ColorMode.CODING,
+    ColorMode.GAME,
+    ColorMode.M_BOOK,
+    ColorMode.USER,
+    ColorMode.EPAPER,
+    ColorMode.CARE_MODE,
+    ColorMode.SRGB,
+    ColorMode.HDR,
+    ColorMode.CINEMA,
+    ColorMode.DARK_THEME,
+    ColorMode.LIGHT_THEME,
+    ColorMode.M_PHOTO,
+)
+
+
+def color_mode_name(value: int) -> str:
+    """Return the human name for a VCP 0xDC value, or ``Mode 0xNN``."""
+    code = int(value) & 0xFF
+    return BENQ_COLOR_MODES.get(code, f"Mode 0x{code:02X}")
 
 # MCCS "Get VCP Feature Reply" result codes.
 RESULT_OK = 0x00

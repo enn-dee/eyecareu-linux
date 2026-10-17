@@ -12,6 +12,7 @@ import platform
 import shutil
 import sys
 
+from . import mccs
 from .ddc.manager import MonitorManager
 
 
@@ -115,6 +116,10 @@ def run() -> int:
                 else:
                     detail = f"  ({value.error})" if value.error else ""
                     print(f"     {label:<11}: unsupported{detail}")
+            if state.color_modes:
+                modes = ", ".join(f"0x{code:02X}={mccs.color_mode_name(code)}"
+                                  for code in state.color_modes)
+                print(f"     modes      : {modes}")
     finally:
         manager.close()
 

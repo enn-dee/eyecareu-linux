@@ -83,32 +83,66 @@ Flickable {
                 onActivated: core.setMuted(core.selectedDisplayId, value)
             }
 
-            RowLayout {
+            Text {
+                text: "Picture mode"
+                color: Theme.text
+                font.pixelSize: Theme.fontBase
                 Layout.fillWidth: true
-                Text {
-                    text: "Picture mode"
-                    color: Theme.text
-                    font.pixelSize: Theme.fontBase
-                    Layout.fillWidth: true
-                }
-                ComboBox {
-                    id: modeCombo
-                    enabled: core.selectedMonitor.colorModeSupported === true
+            }
+
+            Flow {
+                Layout.fillWidth: true
+                visible: core.selectedMonitor.colorModeSupported === true
+                spacing: 8
+
+                Repeater {
                     model: core.pictureModes
-                    textRole: "label"
-                    valueRole: "value"
-                    currentIndex: {
-                        var list = core.pictureModes
-                        var target = core.selectedMonitor.colorMode
-                        for (var i = 0; i < list.length; i++) {
-                            if (list[i].value === target) return i
+
+                    Rectangle {
+                        id: modeButton
+                        required property var modelData
+                        readonly property bool active: core.selectedMonitor.colorMode === modelData.value
+                        width: modeText.implicitWidth + 26
+                        height: 34
+                        radius: Theme.radiusSmall
+                        color: active ? Theme.accent : Theme.surfaceAlt
+                        border.width: 1
+                        border.color: active ? Theme.accent : Theme.border
+
+                        Text {
+                            id: modeText
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            color: modeButton.active ? "#ffffff" : Theme.text
+                            font.pixelSize: Theme.fontBase
                         }
-                        return -1
-                    }
-                    onActivated: function (index) {
-                        if (index >= 0) core.setColorMode(core.selectedDisplayId, core.pictureModes[index].value)
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: core.setColorMode(core.selectedDisplayId, modelData.value)
+                        }
                     }
                 }
+            }
+
+            Text {
+                visible: core.selectedMonitor.colorModeSupported === true
+                         && core.selectedMonitor.probed !== true
+                text: "Reading the picture-mode list from the display\u2026"
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSmall
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+
+            Text {
+                visible: core.selectedMonitor.colorModeSupported !== true
+                text: "This display does not report a picture-mode list (VCP 0xDC)."
+                color: Theme.textDim
+                font.pixelSize: Theme.fontSmall
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
             }
 
             Text {

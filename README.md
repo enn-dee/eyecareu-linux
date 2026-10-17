@@ -36,15 +36,24 @@ parsing. Observed facts are separated from convention throughout the code.
 | Brightness | `0x10` | `getBrightness` / `setBrightness` |
 | Volume | `0x62` | |
 | Mute | `0x8D` | `1` = muted, `2` = unmuted |
-| Picture mode | `0xDC` | 16-bit value; the mode is the low byte |
+| Picture mode | `0xDC` | 16-bit `(sub << 8) | mode`; `sub` is usually 0 but not always |
 | OSD lock/status | `0xCA` | |
 | Firmware version | `0xC9` | |
 | Picture blank | `0xF6` | |
 | VCP version probe | `0xDF` | used as the DDC link test |
 | Factory reset | `0x04` / `0x08` | |
 
-Picture-mode values for `0xDC`: **Standard `0x00`**, **Care Mode `0x01`**,
-**Game `0x28`**, **Cinema `0x32`** (plus common MCCS extras).
+Picture-mode values for `0xDC` are read from each panel's own capability
+string (e.g. a GW2490 answers `vcp(... DC(00 03 0F 12 27 28) ...)`), so the UI
+offers exactly the modes a given model advertises. The named map in
+`eyecareu/mccs.py` covers the BenQ set: Standard `0x00`, Care Mode `0x01`,
+Cinema/Movie `0x03`, sRGB `0x0A`, M-book `0x0F`, User `0x12`, M-Photo `0x1E`,
+ePaper `0x1F`, HDR `0x23`, Coding `0x27`, Game `0x28`, Dark/Light theme
+`0x30`/`0x31`, Cinema `0x32`. Because the value is a 16-bit `(sub << 8) | mode`
+pair and some panels only accept a non-zero `sub` (a GW2490 takes Coding only as
+`0x0127`/`0x0227`), the write is confirmed with a read-back and a small sub
+ladder, and modes a panel does not accept over DDC/CI (some are OSD-only) are
+reported rather than silently ignored.
 
 Contrast (`0x12`) and the remaining MCCS codes in `eyecareu/mccs.py` are
 standard-convention defaults, **not** observed BenQ behaviour. The BenQ vendor
@@ -157,7 +166,9 @@ eyecareu/
 │   ├── i2c.py         raw DDC/CI over /dev/i2c-* (no dependencies)
 │   ├── ddcutil.py     backend delegating to the ddcutil CLI
 │   ├── backlight.py   sysfs /sys/class/backlight backend (internal panels)
-│   └── manager.py     backend selection + capability resolution
+│   ├── capcache.py    on-disk capability-string cache (keyed by EDID)
+│   ├── manager.py     backend selection + capability resolution
+│   └── worker.py      DDC/CI worker thread + poll loop
 ├── display/
 │   ├── session.py     X11/Wayland detection, output enumeration
 │   ├── gamma.py       XRandR gamma ramps via ctypes + colour maths
@@ -179,6 +190,22 @@ eyecareu/
   VESA DDC/CI 1.1 packet format; because many panels never acknowledge a
   `Set VCP Feature`, a silent bus after a write is treated as success (a
   positive acknowledgement is still honoured when one is sent).
+* **DDC/CI runs on its own thread** (`ddc/worker.py`), not on the Qt GUI thread
+  — the same split the Windows build uses (`EcShared.dll`: *"property writes
+  involving VCP are performed on a separate thread"*, with `QThread`/`QMutex`/
+  `QTimer`). A single VCP round trip is tens of milliseconds and a full monitor
+  probe is seconds, so doing it on the GUI thread freezes the window. The UI
+  reads only the cached state and reacts to a change signal. The periodic poll
+  re-reads just the values that change, and rapid slider input is coalesced so
+  the bus never accumulates a backlog.
+* **Capability strings are cached** — in memory, and on disk under
+  `~/.local/state/eyecareu/capabilities/`, keyed by the monitor's EDID. Reading
+  them is the most expensive DDC/CI conversation (and the flakiest: some panels
+  return stale or misaligned frames, so each chunk is offset-validated and may
+  be retried). The cache makes every start after the first instant; the
+  user-facing refresh re-reads the panel and replaces the cached copy. A
+  monitor whose link test or capability read fails is retried on a backoff, so
+  a transient bus error recovers on its own.
 * **Software effects** are dispatched to the best backend for the session:
   * **Hyprland** — real, whole-screen colour temperature *and* dimming through
     the `hyprland-ctm-control-v1` protocol, driven by the `hyprsunset` daemon
@@ -189,8 +216,9 @@ eyecareu/
   session does not have those supplementary groups yet. `regroup.py` re-executes
   the app through the setuid `sg` helper once, so DDC/CI works immediately
   instead of after a logout. Disable with `EYECAREU_NO_REGROUP=1`.
-* **State** lives in `~/.config/eyecareu/config.json` and
-  `~/.local/state/eyecareu/screentime.json`; writes are atomic and debounced.
+* **State** lives in `~/.config/eyecareu/config.json`,
+  `~/.local/state/eyecareu/screentime.json` and the capability cache under
+  `~/.local/state/eyecareu/capabilities/`; writes are atomic and debounced.
 
 ### Session support
 

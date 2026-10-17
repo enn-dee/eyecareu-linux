@@ -238,6 +238,285 @@ class MccsTests(unittest.TestCase):
         self.assertEqual(int(mccs.Vcp.COLOR_MODE), 0xDC)
         self.assertEqual(int(mccs.ColorMode.CARE_MODE), 0x01)
 
+    def test_color_mode_names(self) -> None:
+        self.assertEqual(mccs.color_mode_name(0x00), "Standard")
+        self.assertEqual(mccs.color_mode_name(0x27), "Coding")
+        self.assertEqual(mccs.color_mode_name(0x28), "Game")
+        self.assertEqual(mccs.color_mode_name(0x0F), "M-book")
+        self.assertEqual(mccs.color_mode_name(0x12), "User")
+        self.assertEqual(mccs.color_mode_name(0x1F), "ePaper")
+        # Unknown values degrade to a readable, non-crashing label.
+        self.assertEqual(mccs.color_mode_name(0xAB), "Mode 0xAB")
+
+
+class CapabilityStringTests(unittest.TestCase):
+    """Parsing of a real BenQ capability string (GW2490, MCCS 2.2)."""
+
+    CAPS = (
+        "(prot(monitor)type(lcd)model(GW2490)cmds(01 02 03 07 0C E3 F3)"
+        "vcp(02 04 08 10 12 14(04 05 08 0B) 16 18 19 1A 52 60(0F 11 12) "
+        "62 72(50 64 78 8C A0) 86 (02 05) 87 8D (01 02) C1 C2 C8 C9 D2 "
+        "DC(00 03 0F 12 27 28) DF E1 E2(00 FF) EA(00 01 02 03 04 05) "
+        "EB(00 01 02 03) EE (00 01 02) F0 (00 01 02) F1(00 1E 2D 3D) "
+        "F8 (00 0A 14 1E) FD(00 01 02 03 04) FE FF)mswhql(1)mccs_ver(2.2))"
+    )
+
+    def test_vcp_block_is_paren_balanced(self) -> None:
+        from eyecareu.ddc.manager import _supported_vcps
+
+        codes = _supported_vcps(self.CAPS)
+        # Top-level codes that a naive regex would drop after the first ')'.
+        self.assertIn(0x62, codes)   # volume
+        self.assertIn(0xDC, codes)   # picture mode
+        self.assertIn(0x72, codes)
+        # Nested value-list tokens are not VCP codes.
+        self.assertNotIn(0x50, codes)
+        self.assertNotIn(0x05, codes)
+        self.assertNotIn(0x0B, codes)
+
+    def test_advertised_color_modes(self) -> None:
+        from eyecareu.ddc.manager import _supported_color_modes
+
+        self.assertEqual(_supported_color_modes(self.CAPS),
+                         [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+
+    def test_no_color_modes_without_dc(self) -> None:
+        from eyecareu.ddc.manager import _supported_color_modes
+
+        self.assertEqual(_supported_color_modes("(prot(monitor)vcp(10 62))"), [])
+
+
+class ProbeAndPollTests(unittest.TestCase):
+    """Probing is cached; polling is a cheap value-only refresh.
+
+    These cover the fix for the UI lag: the capability string must be read once
+    (then cached in memory and on disk) instead of on every poll, and a monitor
+    with no DDC link must not be re-probed on the bus.
+    """
+
+    CAPS = CapabilityStringTests.CAPS
+
+    class FakeBackend:
+        name = "fake"
+
+        def __init__(self, caps: str = "", link_ok: bool = True,
+                     link_error: str = "") -> None:
+            self.caps = caps
+            self.link_ok = link_ok
+            self.link_error = link_error
+            self.caps_reads = 0
+            self.vcp_reads = 0
+
+        def get_vcp(self, monitor, vcp):
+            from eyecareu.ddc.base import VcpValue
+
+            self.vcp_reads += 1
+            if vcp == 0xDF:                       # VCP_VERSION link test
+                return VcpValue(vcp=vcp, supported=self.link_ok,
+                                error="" if self.link_ok else self.link_error,
+                                current=0x12, maximum=0x12)
+            return VcpValue(vcp=vcp, current=40, maximum=100, supported=True)
+
+        def set_vcp(self, monitor, vcp, value) -> bool:
+            return True
+
+        def get_capabilities(self, monitor) -> str:
+            self.caps_reads += 1
+            return self.caps
+
+        def close(self) -> None:
+            pass
+
+    def _identity(self):
+        from eyecareu.ddc.base import MonitorIdentity
+
+        return MonitorIdentity(display_id="card1-HDMI-A-1", i2c_bus=4,
+                               manufacturer="BNQ", model="GW2490")
+
+    def _refresh(self, manager, identity):
+        from unittest import mock
+
+        with mock.patch("eyecareu.ddc.manager.discover_monitors",
+                        return_value=[identity]):
+            return manager.refresh()
+
+    def test_capabilities_read_once_in_memory(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(caps=self.CAPS)
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            identity = self._identity()
+            first = self._refresh(manager, identity)
+            second = self._refresh(manager, identity)
+            manager.poll()
+            manager.poll()
+        self.assertEqual(backend.caps_reads, 1)
+        self.assertEqual(first[0].color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+        self.assertEqual(second[0].color_modes, first[0].color_modes)
+
+    def test_capabilities_cached_on_disk(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        identity = self._identity()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            cold = self.FakeBackend(caps=self.CAPS)
+            self._refresh(MonitorManager(backend=cold), identity)
+            warm = self.FakeBackend(caps=self.CAPS)
+            states = self._refresh(MonitorManager(backend=warm), identity)
+        self.assertEqual(cold.caps_reads, 1)
+        self.assertEqual(warm.caps_reads, 0)      # served from disk
+        self.assertEqual(states[0].color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+
+    def test_poll_only_reads_live_values(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(caps=self.CAPS)
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            self._refresh(manager, self._identity())
+            backend.vcp_reads = 0
+            manager.poll()
+        # A poll reads brightness + colour mode only (not volume/mute/firmware),
+        # and never the capability string.
+        self.assertEqual(backend.vcp_reads, 2)
+        self.assertEqual(backend.caps_reads, 1)
+
+    def test_offline_monitor_skips_capability_read(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(
+            link_ok=False, link_error="DDC transaction failed: I/O error")
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            states = self._refresh(manager, self._identity())
+        self.assertFalse(states[0].online)
+        self.assertEqual(backend.caps_reads, 0)
+
+    def test_progress_callback_fires_before_value_reads(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(caps=self.CAPS)
+        manager = MonitorManager(backend=backend)
+        marks: list[int] = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)), \
+                mock.patch("eyecareu.ddc.manager.discover_monitors",
+                           return_value=[self._identity()]):
+            manager.refresh(on_update=lambda: marks.append(1))
+        # The monitor is published (on_update) before the slow capability read.
+        self.assertEqual(marks, [1])
+
+    def test_offline_monitor_recovers_on_later_poll(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(
+            link_ok=False, link_error="DDC transaction failed: I/O error")
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            identity = self._identity()
+            states = self._refresh(manager, identity)
+            self.assertFalse(states[0].online)
+            self.assertEqual(backend.caps_reads, 0)
+            # A transient bus failure must not mark the monitor offline for the
+            # rest of the session: the link test is retried on later polls.
+            backend.link_ok = True
+            backend.caps = self.CAPS
+            states[0].retry_after = 0.0
+            manager.poll()
+        state = manager.monitor(identity.display_id)
+        self.assertTrue(state.online)
+        self.assertEqual(backend.caps_reads, 1)
+        self.assertEqual(state.color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+
+    def test_failed_read_keeps_last_good_value(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.base import VcpValue
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(caps=self.CAPS)
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            identity = self._identity()
+            states = self._refresh(manager, identity)
+            self.assertTrue(states[0].brightness.supported)
+            good = states[0].brightness.current
+            original = backend.get_vcp
+            backend.get_vcp = lambda monitor, vcp: (       # next read fails
+                VcpValue(vcp=vcp) if vcp == 0x10 else original(monitor, vcp))
+            manager.poll()
+        self.assertTrue(states[0].brightness.supported)
+        self.assertEqual(states[0].brightness.current, good)
+
+    def test_failed_capability_read_is_retried(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import MonitorManager
+
+        backend = self.FakeBackend(caps="")        # flaky read returns nothing
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            state = self._refresh(manager, self._identity())[0]
+            self.assertTrue(state.online)
+            self.assertEqual(state.color_modes, list(mccs.DEFAULT_COLOR_MODES))
+            # The read is retried on a later poll and the real modes appear.
+            backend.caps = self.CAPS
+            state.retry_after = 0.0
+            manager.poll()
+        self.assertEqual(state.color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+
+    def test_capability_retries_are_bounded(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.manager import (
+            CAPABILITY_ATTEMPTS,
+            NO_RETRY,
+            MonitorManager,
+        )
+
+        backend = self.FakeBackend(caps="")
+        manager = MonitorManager(backend=backend)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("eyecareu.ddc.capcache.state_dir",
+                           return_value=Path(tmp)):
+            state = self._refresh(manager, self._identity())[0]
+            for _ in range(CAPABILITY_ATTEMPTS - 1):
+                state.retry_after = 0.0
+                manager.poll()
+            self.assertEqual(state.caps_attempts, CAPABILITY_ATTEMPTS)
+            self.assertEqual(state.retry_after, NO_RETRY)
+            reads = backend.caps_reads
+            manager.poll()                          # bounded: no further read
+            self.assertEqual(backend.caps_reads, reads)
+
 
 class HyprsunsetParamTests(unittest.TestCase):
     def _settings(self, **kwargs):
@@ -333,6 +612,62 @@ class I2cSetVcpTests(unittest.TestCase):
             with self.assertRaises(DdcError) as ctx:
                 backend.set_vcp(monitor, 0x10, 50)
         self.assertIn("i2c", str(ctx.exception).lower())
+
+
+class ColorModeWriteTests(unittest.TestCase):
+    """``set_color_mode`` confirms via read-back and tries the BenQ sub ladder."""
+
+    class FakeBackend:
+        name = "fake"
+
+        def __init__(self, accepts: set[int]) -> None:
+            self.accepts = set(accepts)
+            self.writes: list[int] = []
+            self.current = 0x0000
+
+        def get_vcp(self, monitor, vcp):
+            from eyecareu.ddc.base import VcpValue
+
+            return VcpValue(vcp=vcp, current=self.current, maximum=0x0428,
+                            supported=True)
+
+        def set_vcp(self, monitor, vcp, value) -> bool:
+            self.writes.append(value)
+            if value in self.accepts:
+                self.current = value
+            return True
+
+        def get_capabilities(self, monitor) -> str:
+            return ""
+
+        def close(self) -> None:
+            pass
+
+    def _manager(self, accepts):
+        from eyecareu.ddc.base import MonitorIdentity
+        from eyecareu.ddc.manager import MonitorManager, MonitorState
+
+        backend = self.FakeBackend(accepts)
+        manager = MonitorManager(backend=backend)
+        identity = MonitorIdentity(display_id="d0", i2c_bus=4, manufacturer="BNQ")
+        manager._monitors["d0"] = MonitorState(identity=identity)
+        return manager, backend
+
+    def test_mode_with_sub_zero(self) -> None:
+        manager, backend = self._manager({0x0028})
+        self.assertTrue(manager.set_color_mode("d0", 0x28))
+        self.assertEqual(backend.writes, [0x0028])
+        self.assertEqual(backend.current, 0x0028)
+
+    def test_coding_uses_non_zero_sub(self) -> None:
+        manager, backend = self._manager({0x0127})
+        self.assertTrue(manager.set_color_mode("d0", 0x27))
+        self.assertEqual(backend.writes, [0x0027, 0x0127])
+
+    def test_rejected_mode_returns_false(self) -> None:
+        manager, backend = self._manager(set())
+        self.assertFalse(manager.set_color_mode("d0", 0x03))
+        self.assertEqual(backend.writes, [0x0003, 0x0103, 0x0203])
 
 
 class RegroupTests(unittest.TestCase):

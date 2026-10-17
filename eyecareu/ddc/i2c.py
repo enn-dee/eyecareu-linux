@@ -87,7 +87,8 @@ class I2cDdcBackend(DdcBackend):
             raise DdcError(f"truncated DDC reply ({len(data)} < {expect_data})")
         return data
 
-    def _transact(self, bus: int, data: bytes, expect_data: int) -> bytes:
+    def _transact(self, bus: int, data: bytes, expect_data: int,
+                  validator=None) -> bytes:
         node = self._device_node(bus)
         last_error: Exception | None = None
         for attempt in range(self._retries):
@@ -96,6 +97,11 @@ class I2cDdcBackend(DdcBackend):
                 fd = self._open_bus(bus)
                 self._write_packet(fd, data)
                 reply = self._read_reply(fd, expect_data)
+                # Displays occasionally emit a stale frame (e.g. leftover
+                # capability bytes) *after* a request; reject it and retry
+                # rather than returning a plausible-looking wrong value.
+                if validator is not None and not validator(reply):
+                    raise DdcError("unexpected DDC reply for request")
                 return reply
             except OSError as exc:
                 last_error = exc
@@ -130,7 +136,10 @@ class I2cDdcBackend(DdcBackend):
         if monitor.i2c_bus is None:
             return VcpValue(vcp=vcp, error="no i2c bus for display")
         try:
-            data = self._transact(monitor.i2c_bus, bytes([0x01, vcp]), expect_data=8)
+            data = self._transact(
+                monitor.i2c_bus, bytes([0x01, vcp]), expect_data=8,
+                validator=lambda r: len(r) >= 3 and r[0] == 0x02 and r[2] == vcp,
+            )
         except DdcError as exc:
             return VcpValue(vcp=vcp, error=str(exc))
         result = data[1]
@@ -186,24 +195,40 @@ class I2cDdcBackend(DdcBackend):
             return ""
         chunks: list[str] = []
         offset = 0
-        try:
-            while offset < 0x10000:
-                reply = self._transact(
-                    monitor.i2c_bus,
-                    bytes([0xF3, (offset >> 8) & 0xFF, offset & 0xFF]),
-                    expect_data=5,
-                )
-                # Capability reply data: 0xE3 <offset_hi> <offset_lo> <len> <data...>
-                if not reply or reply[0] != 0xE3:
+        stalls = 0
+        # Reply payload layout: 0xE3 <offset_hi> <offset_lo> <ascii...>.
+        # There is *no* separate length byte — the display returns the bytes
+        # starting at the requested offset, and the host advances by however
+        # many it received.  (Assuming a length byte here truncated the string
+        # at the first chunk, which hid VCP 0xDC / picture-mode support.)
+        while offset < 0x10000 and stalls < 3:
+            reply = None
+            for _ in range(3):        # the DDC bus drops chunks occasionally
+                try:
+                    reply = self._transact(
+                        monitor.i2c_bus,
+                        bytes([0xF3, (offset >> 8) & 0xFF, offset & 0xFF]),
+                        expect_data=4,
+                        # The display sometimes still has the *previous* chunk
+                        # queued when we ask for the next one; a stale frame is
+                        # also a valid 0xE3 reply, so the requested offset must
+                        # match or the string would gain duplicated bytes.
+                        validator=lambda r, off=offset: (
+                            len(r) >= 3 and r[0] == 0xE3
+                            and ((r[1] << 8) | r[2]) == off),
+                    )
                     break
-                length = reply[4] if len(reply) > 4 else 0
-                body = reply[5:5 + length]
-                if not body:
-                    break
-                chunks.append(body.decode("ascii", "ignore"))
-                offset += len(body)
-                if len(body) < 32:
-                    break
-        except DdcError:
-            return "".join(chunks)
+                except DdcError:
+                    reply = None
+                    time.sleep(_T_RETRY_S)
+            if not reply:
+                stalls += 1
+                continue
+            body = reply[3:]
+            if not body:
+                stalls += 1
+                continue
+            chunks.append(body.decode("ascii", "ignore"))
+            offset += len(body)
+            stalls = 0
         return "".join(chunks)
