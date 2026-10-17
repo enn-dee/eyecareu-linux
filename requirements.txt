@@ -1,0 +1,12 @@
+# Runtime dependencies for the Eye-CareU Linux port.
+#
+# The application itself only needs PySide6.  All other features degrade
+# gracefully when the optional tools are missing.
+
+PySide6>=6.5
+
+# --- optional, installed by the system package manager on Fedora -----------
+# ddcutil            DDC/CI control (preferred backend when present)
+# i2c-tools          i2cdetect/i2cget for diagnostics
+# xrandr             X11 output listing / verification
+# xprintidle         idle detection for accurate screen-time accounting

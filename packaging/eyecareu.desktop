@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Eye-CareU
+GenericName=Monitor Eye Care
+Comment=Monitor eye-care assistant: DDC/CI control, timers, reminders and report
+Exec=eyecareu
+Icon=eyecareu
+Terminal=false
+Categories=Utility;Monitor;
+Keywords=eye;care;monitor;brightness;ddc;night light;blue light;
+StartupNotify=true
+StartupWMClass=Eye-CareU

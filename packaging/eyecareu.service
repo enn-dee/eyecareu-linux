@@ -1,0 +1,15 @@
+[Unit]
+Description=Eye-CareU monitor eye-care assistant
+Documentation=file:///usr/share/doc/eyecareu/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Runs in the tray; adjust the interpreter path if you used a virtualenv.
+ExecStart=/usr/bin/eyecareu --tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

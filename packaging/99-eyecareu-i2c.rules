@@ -1,0 +1,24 @@
+# Grant the active local user access to the hardware that Eye-CareU drives:
+#
+#   1. the i2c buses that carry DDC/CI  -> monitor brightness/volume/picture mode
+#   2. the sysfs backlight class        -> internal laptop panel brightness
+#
+# Install to /etc/udev/rules.d/ and reload:
+#   sudo install -m 0644 99-eyecareu-i2c.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Your user must belong to the 'i2c' and 'video' groups (the install script
+# creates 'i2c' and adds you to both), then log out and back in.
+
+# --- DDC/CI over i2c ------------------------------------------------------
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"
+
+# Some distributions use the 'video' group for i2c instead.  Uncomment if so:
+# SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", GROUP="video", MODE="0660"
+
+# --- Internal panel backlight --------------------------------------------
+# Note: 'udevadm trigger' synthesises 'change' events by default, so match
+# both add and change or the rule will not re-apply after installation.
+ACTION=="add|change", SUBSYSTEM=="backlight", KERNEL=="*", \
+    RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", \
+    RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"
