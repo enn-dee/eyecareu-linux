@@ -1,5 +1,11 @@
 # Eye-CareU for Linux
 
+[![Release](https://img.shields.io/github/v/release/enn-dee/eyecareu-linux?label=release)](https://github.com/enn-dee/eyecareu-linux/releases/latest)
+[![CI](https://github.com/enn-dee/eyecareu-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/enn-dee/eyecareu-linux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![X11 & Wayland](https://img.shields.io/badge/session-X11%20%7C%20Wayland-blueviolet.svg)](#session-support)
+
 A native Linux port of **BenQ Eye-CareU** (Windows v1.5.5.0), rebuilt for
 Fedora and other modern distributions. It talks to BenQ and other DDC/CI
 monitors over the standard Linux `i2c-dev` interface, and it reimplements the
@@ -10,6 +16,49 @@ temperature, screen-time report) as first-class Linux functionality.
 * **Sessions:** X11 and Wayland (see [Session support](#session-support)).
 * **Dependencies:** `PySide6` plus optional `ddcutil`, `i2c-tools`, `xrandr`,
   `xprintidle` from the distribution.
+
+![Eye-CareU for Linux — Home](docs/screenshots/home.png)
+
+| Display (DDC/CI) | Eye care | Screen-time report |
+| --- | --- | --- |
+| ![Display](docs/screenshots/display.png) | ![Eye care](docs/screenshots/effects.png) | ![Report](docs/screenshots/report.png) |
+
+*Real renders of the Qt/QML UI — more in [`docs/screenshots/`](docs/screenshots/).*
+
+## Quick start
+
+```bash
+git clone https://github.com/enn-dee/eyecareu-linux
+cd eyecareu-linux
+./install-fedora.sh                    # Fedora & derivatives, per-user install
+# ./install-fedora.sh --system         # ...or system-wide (needs sudo)
+```
+
+Arch Linux — build the bundled PKGBUILD:
+
+```bash
+cd packaging/aur && makepkg -si
+```
+
+Any other distribution, or straight from source:
+
+```bash
+python3 -m pip install --user .
+sudo install -m 0644 packaging/99-eyecareu-i2c.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then:
+
+```bash
+eyecareu               # window
+eyecareu --tray        # start in the system tray
+eyecareu --doctor      # diagnose session, groups, colour backend and monitors
+```
+
+> After the udev rule is installed, **log out and back in** (or run
+> `newgrp i2c`) so your user joins the `i2c` group. The app also re-execs
+> through `sg` on first run, so hardware control normally works immediately.
 
 ---
 
@@ -99,9 +148,9 @@ report, Ambient Light, Visual Optimizer, Scaled Resolution.
 | --- | --- | --- |
 | Brightness / Volume / Mute (DDC/CI) | `ddc` package (i2c-dev or `ddcutil`) | ✅ |
 | Picture mode (DDC/CI `0xDC`) | `MonitorManager.set_color_mode` | ✅ |
-| Night light | X11 gamma ramp (`display/gamma.py`) | ✅ (X11) |
-| Low blue light | Gamma-ramp blue attenuation | ✅ (X11) |
-| Software dimming | Gamma-ramp brightness scaling | ✅ (X11) |
+| Night light | hyprsunset CTM (Hyprland) / X11 gamma ramp | ✅ |
+| Low blue light | Blue attenuation: CTM or gamma ramp | ✅ |
+| Software dimming | Dimming: CTM or gamma ramp | ✅ |
 | Warm tint | Gamma-ramp warm shift | ✅ |
 | ClearType text | Mild gamma/contrast ramp | ✅ |
 | Circadian mode | Local schedule or solar times | ✅ |
@@ -118,10 +167,10 @@ report, Ambient Light, Visual Optimizer, Scaled Resolution.
 
 ---
 
-## Install (Fedora)
+## Install (from source, Fedora)
 
 ```bash
-git clone <this-repo> eyecareu-linux
+git clone https://github.com/enn-dee/eyecareu-linux
 cd eyecareu-linux
 ./install-fedora.sh              # per-user install (recommended)
 # or: ./install-fedora.sh --system
@@ -133,6 +182,21 @@ installs the Python package, and registers the desktop entry and icon.
 
 > After the udev rule is installed, **log out and back in** (or run
 > `newgrp i2c`) so your user joins the `i2c` group.
+
+### Arch Linux (AUR-ready PKGBUILD)
+
+A `PKGBUILD` ships in [`packaging/aur/`](packaging/aur). Build and install it
+locally:
+
+```bash
+cd packaging/aur
+makepkg -si
+```
+
+It installs the same files as the Fedora script (package, desktop entry, icon
+and udev rule) from a release tarball, and depends on the distribution's
+`python-pyside6`. Regenerate `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`
+before pushing it to the AUR.
 
 ### Manual install
 
@@ -257,7 +321,7 @@ without layer-shell, so it is best-effort). On X11 the gamma ramp is used.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -v   # 33 unit tests, no hardware needed
+python3 -m unittest discover -s tests -v   # 54 unit tests, no hardware needed
 python3 -m eyecareu                         # run from a checkout
 ```
 

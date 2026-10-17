@@ -1,0 +1,22 @@
+pkgbase = eyecareu
+	pkgdesc = Linux port of BenQ Eye-CareU: DDC/CI monitor control and software eye-care
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/enn-dee/eyecareu-linux
+	install = eyecareu.install
+	arch = any
+	license = MIT
+	depends = python
+	depends = python-pyside6
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-wheel
+	makedepends = python-setuptools
+	optdepends = ddcutil: alternative DDC/CI backend (handles more adapters)
+	optdepends = i2c-tools: i2c-detect and friends for bus debugging
+	optdepends = xorg-xrandr: X11 colour (gamma ramp) support
+	optdepends = xprintidle: idle detection for the timers/reminders
+	source = https://github.com/enn-dee/eyecareu-linux/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = c58ab7f3ccd4b083bd40582a7ac1d03cc34b10bbc496b01434c2a009bb9909da
+
+pkgname = eyecareu

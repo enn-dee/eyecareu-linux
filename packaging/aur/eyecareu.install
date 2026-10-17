@@ -1,0 +1,26 @@
+post_install() {
+    cat <<'EOF'
+==> Eye-CareU was installed.
+
+DDC/CI monitor control needs your user to be able to talk to /dev/i2c-*.
+The udev rule shipped with this package puts those devices in the 'i2c'
+group, so run (once):
+
+    sudo groupadd -f i2c
+    sudo usermod -aG i2c,video "$USER"
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+
+then log out and back in (the app also re-execs itself through 'sg', so
+DDC/CI normally works on the next launch without logging out).
+
+Internal laptop panels use /sys/class/backlight and need 'video' group
+membership plus the same udev trigger.
+
+Run 'eyecareu --doctor' to check session, groups, colour backend and
+every detected monitor.
+EOF
+}
+
+post_upgrade() {
+    post_install
+}

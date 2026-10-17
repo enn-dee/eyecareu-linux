@@ -1,0 +1,52 @@
+# Maintainer: enn-dee <89350768+enn-dee@users.noreply.github.com>
+#
+# Linux port of BenQ Eye-CareU: DDC/CI monitor control and software eye-care.
+# Build and install locally with:
+#     makepkg -si
+#
+# Before pushing to the AUR, refresh the metadata with:
+#     makepkg --printsrcinfo > .SRCINFO   # then bump pkgrel, update checksums:
+#     updpkgsums                          # after changing pkgver
+#
+pkgname=eyecareu
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Linux port of BenQ Eye-CareU: DDC/CI monitor control and software eye-care"
+arch=('any')
+url="https://github.com/enn-dee/eyecareu-linux"
+license=('MIT')
+depends=('python' 'python-pyside6')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools')
+optdepends=(
+    'ddcutil: alternative DDC/CI backend (handles more adapters)'
+    'i2c-tools: i2c-detect and friends for bus debugging'
+    'xorg-xrandr: X11 colour (gamma ramp) support'
+    'xprintidle: idle detection for the timers/reminders'
+)
+install="$pkgname.install"
+source=("$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('c58ab7f3ccd4b083bd40582a7ac1d03cc34b10bbc496b01434c2a009bb9909da')
+
+prepare() {
+    cd "eyecareu-linux-$pkgver"
+}
+
+build() {
+    cd "eyecareu-linux-$pkgver"
+    python -m build --wheel --no-isolation
+}
+
+package() {
+    cd "eyecareu-linux-$pkgver"
+
+    python -m installer --destdir="$pkgdir" dist/*.whl
+
+    install -Dm644 packaging/eyecareu.desktop \
+        "$pkgdir/usr/share/applications/eyecareu.desktop"
+    install -Dm644 packaging/icons/eyecareu.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/eyecareu.svg"
+    # Distro convention: rules live in /usr/lib/udev/rules.d.
+    install -Dm644 packaging/99-eyecareu-i2c.rules \
+        "$pkgdir/usr/lib/udev/rules.d/99-eyecareu-i2c.rules"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
