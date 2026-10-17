@@ -215,7 +215,7 @@ class EyeCareCore(QObject):
                 "volume": state.volume.percent if state.volume.supported else 0,
                 "volumeSupported": "volume" in state.capabilities.capabilities,
                 "muted": state.mute.supported and state.mute.current == 1,
-                "colorMode": (state.color_mode.current & 0xFF) if state.color_mode.supported else -1,
+                "colorMode": (state.color_mode.current & 0xFFFF) if state.color_mode.supported else -1,
                 "colorModeSupported": "color_mode" in state.capabilities.capabilities,
                 "widthMm": identity.width_mm,
                 "heightMm": identity.height_mm,
@@ -256,12 +256,12 @@ class EyeCareCore(QObject):
 
     @Property("QVariantList", notify=monitorsChanged)
     def pictureModes(self) -> list:
-        """Picture modes the *selected* monitor advertises via VCP 0xDC.
+        """Picture modes the *selected* monitor supports over VCP 0xDC.
 
-        The list comes from the panel's own capability string
-        (``vcp(... DC(00 03 0F 12 27 28) ...)``), so it shows exactly the modes
-        that model supports rather than a generic guess.  Each entry is
-        ``{"value": <int>, "label": <str>}``.
+        The list comes from a verified per-model entry where one exists,
+        otherwise from the panel's own capability string, so it shows the modes
+        that model actually accepts rather than a generic guess.  Each entry is
+        ``{"value": <full 16-bit int>, "label": <str>}``.
         """
         state = self._manager.monitor(self._selected)
         if state is None or not state.probed:

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from .. import mccs
 from ..models import CAPABILITY_MAP, MonitorCapabilities, KNOWN_MODELS
 from . import capcache
-from .base import DdcBackend, MonitorIdentity, VcpValue
+from .base import DdcBackend, DdcError, MonitorIdentity, VcpValue
 from .backlight import BacklightBackend
 from .discovery import discover_monitors
 
@@ -31,6 +31,13 @@ OFFLINE_RETRY_SECONDS = 8.0
 CAPABILITY_ATTEMPTS = 3
 #: Sentinel for "this display is fully probed and needs no further retry".
 NO_RETRY = float("inf")
+#: How many times to re-read VCP 0xDC before trusting a write.  The first read
+#: after a write is frequently a stale frame (the adapter still holds the mode
+#: from *before* the change), and some panels take a second or two to reflect a
+#: switch, so a single read-back is not reliable.
+COLOR_MODE_CONFIRM_READS = 5
+#: Delay between those confirming reads.
+COLOR_MODE_CONFIRM_DELAY_S = 0.20
 
 
 @dataclass(slots=True)
@@ -123,11 +130,13 @@ def _supported_vcps(text: str) -> set[int]:
 
 
 def _supported_color_modes(text: str) -> list[int]:
-    """Return the VCP 0xDC values the panel advertises, in advertised order.
+    """Return the full VCP 0xDC values the panel advertises.
 
-    BenQ panels publish an explicit value list, e.g.
-    ``vcp(... DC(00 03 0F 12 27 28) ...)`` — the authoritative set of picture
-    modes for that exact model.
+    Most BenQ panels publish an explicit value list, e.g.
+    ``vcp(... DC(00 03 0F 12 27 28) ...)``.  A code in that list may stand for
+    several real modes — the GW2490 publishes ``27`` but stores ``0x0127`` /
+    ``0x0227`` / ``0x0427`` — so each advertised code is expanded to the full
+    16-bit values (see :func:`eyecareu.mccs.expand_color_mode`).
     """
     block = _capability_vcp_block(text)
     match = re.search(r"\bDC\s*\(([^)]*)\)", block, re.IGNORECASE)
@@ -137,9 +146,11 @@ def _supported_color_modes(text: str) -> list[int]:
     for token in re.split(r"[\s,]+", match.group(1)):
         token = token.strip()
         if re.fullmatch(r"[0-9A-Fa-f]{1,4}", token):
-            value = int(token, 16)
-            if 0 <= value <= 0xFF and value not in values:
-                values.append(value)
+            code = int(token, 16)
+            if 0 <= code <= 0xFF:
+                for value in mccs.expand_color_mode(code):
+                    if value not in values:
+                        values.append(value)
     return values
 
 
@@ -315,7 +326,7 @@ class MonitorManager:
                                  else NO_RETRY)
 
         state.capability_string = capabilities
-        state.color_modes = _supported_color_modes(capabilities)
+        state.color_modes = self._resolve_color_modes(state, capabilities)
         state.capabilities = self._resolve_capabilities(state, capabilities)
         self._refresh_values(state)
         # Trust the live probe when the capability string is missing or omits
@@ -326,6 +337,20 @@ class MonitorManager:
         if not state.color_modes:
             state.color_modes = list(mccs.DEFAULT_COLOR_MODES)
         state.probed = True
+
+    def _resolve_color_modes(self, state: MonitorState,
+                             capability_string: str) -> list[int]:
+        """Full 16-bit picture-mode values to offer for *state*.
+
+        A verified per-model list wins, because a few panels advertise a mode
+        list that does not match what they actually accept (see
+        :data:`eyecareu.mccs.MODEL_COLOR_MODES`).  Otherwise the panel's own
+        ``DC(...)`` list is used, each code expanded to its full value.
+        """
+        known = mccs.MODEL_COLOR_MODES.get(state.identity.model.upper())
+        if known:
+            return [int(value) for value in known]
+        return _supported_color_modes(capability_string)
 
     def _resolve_capabilities(self, state: MonitorState,
                               capability_string: str) -> MonitorCapabilities:
@@ -476,33 +501,70 @@ class MonitorManager:
     def set_color_mode(self, display_id: str, mode: int) -> bool:
         """Write a picture mode over VCP 0xDC.
 
-        BenQ panels encode the mode as a 16-bit ``(sub << 8) | value``.  Most
-        modes use ``sub == 0`` but some only take a non-zero ``sub`` (on the
-        GW2490, *Coding* = ``0x27`` is only accepted as ``0x0127``/``0x0227``).
-        The applicable sub is not derivable from the capability string, so the
-        write is confirmed with a read-back and a small ladder of sub values is
-        tried.  Returns True only when the panel reports the requested mode.
+        *mode* is a full 16-bit value.  BenQ encodes some modes as
+        ``(SHCode << 8) | Code`` — the GW2490 stores Care Mode / Coding / ePaper
+        as ``0x0127`` / ``0x0227`` / ``0x0427`` — so the value is written
+        verbatim.  A bare low byte is expanded through
+        :func:`eyecareu.mccs.expand_color_mode` (and, for an unknown code, a
+        small SHCode ladder is tried) so the selector still works on a panel
+        whose capability string is the only source of truth.
+
+        The panel's read-back is the ground truth, retried because the first
+        frame after a write is often stale.  Returns True only once the panel
+        reports the requested mode.
         """
         with self._lock:
             state = self._monitors.get(display_id)
         if state is None:
             return False
         vcp = self.vcp("color_mode", mccs.Vcp.COLOR_MODE)
-        mode &= 0xFF
-        for sub in (0x00, 0x01, 0x02):
-            value = (sub << 8) | mode
-            ok = self._backend.set_vcp(state.identity, vcp, value)
-            fresh = self._backend.get_vcp(state.identity, vcp)
-            if fresh.supported:
-                state.color_mode = fresh
-                if (fresh.current & 0xFF) == mode:
-                    return True
-            elif ok:
-                # No read-back channel: trust the write as before.
-                state.color_mode.current = value
+
+        value = int(mode) & 0xFFFF
+        if value <= 0xFF:
+            candidates = list(mccs.expand_color_mode(value))
+            if candidates == [value]:
+                # Unknown code: some models need it in the high half.  (The
+                # GW2490 uses sub-codes 1/2/4, not a contiguous ladder.)
+                candidates = [(sub << 8) | value
+                              for sub in (0x00, 0x01, 0x02, 0x04)]
+        else:
+            candidates = [value]
+
+        for candidate in candidates:
+            try:
+                written = self._backend.set_vcp(state.identity, vcp, candidate)
+            except DdcError:
+                continue
+            confirmed = self._confirm_color_mode(state, vcp, candidate)
+            if confirmed is True:
+                return True
+            if confirmed is None and written:
+                # No read-back channel on this display: trust the write.
+                state.color_mode.current = candidate
                 state.color_mode.supported = True
                 return True
         return False
+
+    def _confirm_color_mode(self, state: MonitorState, vcp: int,
+                            expected: int) -> bool | None:
+        """Read VCP 0xDC back until it matches *expected*.
+
+        Returns True on a match, False when the panel reported a different mode,
+        and None when the display gave no usable read-back at all.
+        """
+        last: VcpValue | None = None
+        for _ in range(COLOR_MODE_CONFIRM_READS):
+            fresh = self._backend.get_vcp(state.identity, vcp)
+            if fresh.supported:
+                last = fresh
+                if fresh.current == expected:
+                    state.color_mode = fresh
+                    return True
+            time.sleep(COLOR_MODE_CONFIRM_DELAY_S)
+        if last is not None:
+            state.color_mode = last
+            return False
+        return None
 
     def close(self) -> None:
         with self._lock:

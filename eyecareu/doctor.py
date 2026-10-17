@@ -117,7 +117,7 @@ def run() -> int:
                     detail = f"  ({value.error})" if value.error else ""
                     print(f"     {label:<11}: unsupported{detail}")
             if state.color_modes:
-                modes = ", ".join(f"0x{code:02X}={mccs.color_mode_name(code)}"
+                modes = ", ".join(f"0x{code:04X}={mccs.color_mode_name(code)}"
                                   for code in state.color_modes)
                 print(f"     modes      : {modes}")
     finally:

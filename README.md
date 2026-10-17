@@ -36,24 +36,36 @@ parsing. Observed facts are separated from convention throughout the code.
 | Brightness | `0x10` | `getBrightness` / `setBrightness` |
 | Volume | `0x62` | |
 | Mute | `0x8D` | `1` = muted, `2` = unmuted |
-| Picture mode | `0xDC` | 16-bit `(sub << 8) | mode`; `sub` is usually 0 but not always |
+| Picture mode | `0xDC` | full 16-bit value; BenQ packs an "SHCode" in the high byte |
 | OSD lock/status | `0xCA` | |
 | Firmware version | `0xC9` | |
 | Picture blank | `0xF6` | |
 | VCP version probe | `0xDF` | used as the DDC link test |
 | Factory reset | `0x04` / `0x08` | |
 
-Picture-mode values for `0xDC` are read from each panel's own capability
-string (e.g. a GW2490 answers `vcp(... DC(00 03 0F 12 27 28) ...)`), so the UI
-offers exactly the modes a given model advertises. The named map in
-`eyecareu/mccs.py` covers the BenQ set: Standard `0x00`, Care Mode `0x01`,
-Cinema/Movie `0x03`, sRGB `0x0A`, M-book `0x0F`, User `0x12`, M-Photo `0x1E`,
-ePaper `0x1F`, HDR `0x23`, Coding `0x27`, Game `0x28`, Dark/Light theme
-`0x30`/`0x31`, Cinema `0x32`. Because the value is a 16-bit `(sub << 8) | mode`
-pair and some panels only accept a non-zero `sub` (a GW2490 takes Coding only as
-`0x0127`/`0x0227`), the write is confirmed with a read-back and a small sub
-ladder, and modes a panel does not accept over DDC/CI (some are OSD-only) are
-reported rather than silently ignored.
+Picture-mode values for `0xDC` come from a verified per-model list where one
+exists, otherwise from the panel's own capability string (e.g. a GW2490 answers
+`vcp(... DC(00 03 0F 12 27 28) ...)`), so the UI offers the modes a given model
+actually accepts. The value is the **full 16 bits**: for most modes the low byte
+alone, but BenQ packs an "SHCode" into the high half for some (the C++ `VCPcode
+... Code=".." SHCode=".."` schema). The GW2490 is the concrete example — its
+capability string advertises `27` and `03`, yet writing `0x03` is rejected and
+the three real modes behind `27` are:
+
+| Value | Mode |
+| --- | --- |
+| `0x0127` | Care Mode |
+| `0x0227` | Coding |
+| `0x0427` | ePaper |
+
+and its Cinema mode is `0x32` (which the string *omits*). Other named BenQ values
+in `eyecareu/mccs.py`: Standard `0x00`, Care Mode `0x01`, sRGB `0x0A`, M-book
+`0x0F`, User `0x12`, M-Photo `0x1E`, ePaper `0x1F`, HDR `0x23`, Game `0x28`,
+Dark/Light theme `0x30`/`0x31`, Cinema `0x32`. A write is confirmed by reading
+`0xDC` back (the first frame after a write is often stale, so it is retried), and
+a mode a panel does not accept is reported rather than silently ignored.
+`tools/identify_color_modes.py` walks a panel through the candidate values so a
+new model's names can be recorded.
 
 Contrast (`0x12`) and the remaining MCCS codes in `eyecareu/mccs.py` are
 standard-convention defaults, **not** observed BenQ behaviour. The BenQ vendor
@@ -200,9 +212,10 @@ eyecareu/
   the bus never accumulates a backlog.
 * **Capability strings are cached** — in memory, and on disk under
   `~/.local/state/eyecareu/capabilities/`, keyed by the monitor's EDID. Reading
-  them is the most expensive DDC/CI conversation (and the flakiest: some panels
-  return stale or misaligned frames, so each chunk is offset-validated and may
-  be retried). The cache makes every start after the first instant; the
+  them is the most expensive DDC/CI conversation (and the flakiest: the i2c
+  adapter usually still holds the *previous* frame, so pending frames are drained
+  before each request and each chunk is offset-validated while stale frames are
+  skipped). The cache makes every start after the first instant; the
   user-facing refresh re-reads the panel and replaces the cached copy. A
   monitor whose link test or capability read fails is retried on a backoff, so
   a transient bus error recovers on its own.

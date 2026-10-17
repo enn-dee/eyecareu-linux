@@ -35,6 +35,11 @@ DDC_SOURCE_DISPLAY = 0x6E
 _T_WRITE_READ_S = 0.045
 _T_RETRY_S = 0.050
 _DEFAULT_RETRIES = 3
+#: How long to wait for a valid reply to a "Get VCP Feature" / "Get
+#: Capabilities" request, skipping stale frames meanwhile.
+_REPLY_TIMEOUT_S = 0.60
+#: Many displays send no reply at all to a "Set VCP Feature"; wait only briefly.
+_SET_REPLY_TIMEOUT_S = 0.12
 
 
 def _checksum(packet: bytes) -> int:
@@ -73,19 +78,63 @@ class I2cDdcBackend(DdcBackend):
         os.write(fd, packet)
         time.sleep(_T_WRITE_READ_S)
 
-    def _read_reply(self, fd: int, expect_data: int) -> bytes:
-        raw = os.read(fd, 128)
-        if len(raw) < 3:
-            raise DdcError("short DDC reply")
-        if raw[0] != DDC_SOURCE_DISPLAY:
-            raise DdcError(f"unexpected DDC source 0x{raw[0]:02X}")
-        length = raw[1] & 0x7F
-        if length == 0:
-            raise DdcError("empty DDC reply")
-        data = raw[2:2 + length]
-        if len(data) < expect_data:
-            raise DdcError(f"truncated DDC reply ({len(data)} < {expect_data})")
-        return data
+    def _drain_input(self, fd: int) -> None:
+        """Discard any frames the adapter still holds from earlier traffic."""
+        try:
+            os.set_blocking(fd, False)
+        except OSError:
+            return                       # not a real i2c fd (e.g. in tests)
+        try:
+            for _ in range(64):
+                try:
+                    if not os.read(fd, 128):
+                        break
+                except (BlockingIOError, OSError):
+                    break
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass
+
+    def _read_reply(self, fd: int, expect_data: int, validator=None,
+                    timeout: float = _REPLY_TIMEOUT_S) -> bytes:
+        """Return the first DDC reply frame that passes *validator*.
+
+        The i2c adapter frequently still holds the *previous* frame (often a
+        capability chunk, which is also a valid ``0xE3`` reply) when the reply
+        to the current request is read.  Frames are therefore skipped until one
+        validates or *timeout* elapses — rejecting and retrying the whole
+        transaction cannot make progress against a display that always trails a
+        stale frame.
+        """
+        deadline = time.monotonic() + timeout
+        try:
+            os.set_blocking(fd, False)
+        except OSError as exc:
+            raise DdcError(f"i2c read failed: {exc}") from exc
+        try:
+            while True:
+                try:
+                    raw = os.read(fd, 128)
+                except BlockingIOError:
+                    raw = b""
+                except OSError as exc:
+                    raise DdcError(f"i2c read failed: {exc}") from exc
+                if len(raw) >= 3 and raw[0] == DDC_SOURCE_DISPLAY:
+                    length = raw[1] & 0x7F
+                    data = raw[2:2 + length]
+                    if (length and len(data) >= expect_data
+                            and (validator is None or validator(data))):
+                        return data
+                if time.monotonic() >= deadline:
+                    raise DdcError("no valid DDC reply")
+                time.sleep(0.005)
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass
 
     def _transact(self, bus: int, data: bytes, expect_data: int,
                   validator=None) -> bytes:
@@ -95,14 +144,14 @@ class I2cDdcBackend(DdcBackend):
             fd = -1
             try:
                 fd = self._open_bus(bus)
+                # Clear frames left over from earlier traffic *before* writing,
+                # so the reply we read belongs to this request.
+                self._drain_input(fd)
                 self._write_packet(fd, data)
-                reply = self._read_reply(fd, expect_data)
                 # Displays occasionally emit a stale frame (e.g. leftover
-                # capability bytes) *after* a request; reject it and retry
+                # capability bytes) *after* a request; _read_reply skips those
                 # rather than returning a plausible-looking wrong value.
-                if validator is not None and not validator(reply):
-                    raise DdcError("unexpected DDC reply for request")
-                return reply
+                return self._read_reply(fd, expect_data, validator)
             except OSError as exc:
                 last_error = exc
                 if exc.errno in (errno.EBUSY, errno.EIO, errno.EAGAIN):
@@ -161,12 +210,14 @@ class I2cDdcBackend(DdcBackend):
             fd = -1
             try:
                 fd = self._open_bus(monitor.i2c_bus)
+                self._drain_input(fd)
                 self._write_packet(fd, payload)
                 # Many displays do not acknowledge a "Set VCP Feature" at all
                 # (the bus simply returns silence), so a missing reply is not an
                 # error.  When a reply *is* sent it must confirm result code 0x00.
                 try:
-                    data = self._read_reply(fd, expect_data=2)
+                    data = self._read_reply(fd, expect_data=2,
+                                            timeout=_SET_REPLY_TIMEOUT_S)
                 except DdcError:
                     return True
                 if data[0] != 0x02:

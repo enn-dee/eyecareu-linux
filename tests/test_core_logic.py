@@ -240,13 +240,25 @@ class MccsTests(unittest.TestCase):
 
     def test_color_mode_names(self) -> None:
         self.assertEqual(mccs.color_mode_name(0x00), "Standard")
-        self.assertEqual(mccs.color_mode_name(0x27), "Coding")
         self.assertEqual(mccs.color_mode_name(0x28), "Game")
         self.assertEqual(mccs.color_mode_name(0x0F), "M-book")
         self.assertEqual(mccs.color_mode_name(0x12), "User")
         self.assertEqual(mccs.color_mode_name(0x1F), "ePaper")
+        # Cinema is 0x32, not the plain 0x03 some panels advertise.
+        self.assertEqual(mccs.color_mode_name(0x32), "Cinema")
+        # The GW-series "SHCode" variants share the low byte 0x27.
+        self.assertEqual(mccs.color_mode_name(0x0127), "Care Mode")
+        self.assertEqual(mccs.color_mode_name(0x0227), "Coding")
+        self.assertEqual(mccs.color_mode_name(0x0427), "ePaper")
         # Unknown values degrade to a readable, non-crashing label.
         self.assertEqual(mccs.color_mode_name(0xAB), "Mode 0xAB")
+        self.assertEqual(mccs.color_mode_name(0x0ABC), "Mode 0x0ABC")
+
+    def test_expand_color_mode(self) -> None:
+        # A plain code expands to itself...
+        self.assertEqual(mccs.expand_color_mode(0x28), (0x0028,))
+        # ...while an SHCode code fans out to every real mode.
+        self.assertEqual(mccs.expand_color_mode(0x27), (0x0127, 0x0227, 0x0427))
 
 
 class CapabilityStringTests(unittest.TestCase):
@@ -277,8 +289,10 @@ class CapabilityStringTests(unittest.TestCase):
     def test_advertised_color_modes(self) -> None:
         from eyecareu.ddc.manager import _supported_color_modes
 
+        # The SHCode code 0x27 fans out to its three real modes, in place.
         self.assertEqual(_supported_color_modes(self.CAPS),
-                         [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+                         [0x0000, 0x0003, 0x000F, 0x0012,
+                          0x0127, 0x0227, 0x0427, 0x0028])
 
     def test_no_color_modes_without_dc(self) -> None:
         from eyecareu.ddc.manager import _supported_color_modes
@@ -295,6 +309,12 @@ class ProbeAndPollTests(unittest.TestCase):
     """
 
     CAPS = CapabilityStringTests.CAPS
+
+    #: The verified picture-mode values for the GW2490 (model-specific override).
+    GW_MODES = [0x0000, 0x0032, 0x0028, 0x0427, 0x0127, 0x0227, 0x000F, 0x0012]
+    #: Codes the capability string advertises, expanded to full values.
+    CAPS_MODES = [0x0000, 0x0003, 0x000F, 0x0012,
+                  0x0127, 0x0227, 0x0427, 0x0028]
 
     class FakeBackend:
         name = "fake"
@@ -327,11 +347,11 @@ class ProbeAndPollTests(unittest.TestCase):
         def close(self) -> None:
             pass
 
-    def _identity(self):
+    def _identity(self, model: str = "GW2490"):
         from eyecareu.ddc.base import MonitorIdentity
 
         return MonitorIdentity(display_id="card1-HDMI-A-1", i2c_bus=4,
-                               manufacturer="BNQ", model="GW2490")
+                               manufacturer="BNQ", model=model)
 
     def _refresh(self, manager, identity):
         from unittest import mock
@@ -356,7 +376,7 @@ class ProbeAndPollTests(unittest.TestCase):
             manager.poll()
             manager.poll()
         self.assertEqual(backend.caps_reads, 1)
-        self.assertEqual(first[0].color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+        self.assertEqual(first[0].color_modes, self.GW_MODES)
         self.assertEqual(second[0].color_modes, first[0].color_modes)
 
     def test_capabilities_cached_on_disk(self) -> None:
@@ -374,7 +394,7 @@ class ProbeAndPollTests(unittest.TestCase):
             states = self._refresh(MonitorManager(backend=warm), identity)
         self.assertEqual(cold.caps_reads, 1)
         self.assertEqual(warm.caps_reads, 0)      # served from disk
-        self.assertEqual(states[0].color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+        self.assertEqual(states[0].color_modes, self.GW_MODES)
 
     def test_poll_only_reads_live_values(self) -> None:
         from unittest import mock
@@ -450,7 +470,7 @@ class ProbeAndPollTests(unittest.TestCase):
         state = manager.monitor(identity.display_id)
         self.assertTrue(state.online)
         self.assertEqual(backend.caps_reads, 1)
-        self.assertEqual(state.color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+        self.assertEqual(state.color_modes, self.GW_MODES)
 
     def test_failed_read_keeps_last_good_value(self) -> None:
         from unittest import mock
@@ -484,14 +504,14 @@ class ProbeAndPollTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch("eyecareu.ddc.capcache.state_dir",
                            return_value=Path(tmp)):
-            state = self._refresh(manager, self._identity())[0]
+            state = self._refresh(manager, self._identity(model="Unknown-Model"))[0]
             self.assertTrue(state.online)
             self.assertEqual(state.color_modes, list(mccs.DEFAULT_COLOR_MODES))
             # The read is retried on a later poll and the real modes appear.
             backend.caps = self.CAPS
             state.retry_after = 0.0
             manager.poll()
-        self.assertEqual(state.color_modes, [0x00, 0x03, 0x0F, 0x12, 0x27, 0x28])
+        self.assertEqual(state.color_modes, self.CAPS_MODES)
 
     def test_capability_retries_are_bounded(self) -> None:
         from unittest import mock
@@ -598,6 +618,32 @@ class I2cSetVcpTests(unittest.TestCase):
         # A reply that is not a Set VCP acknowledgement is ignored.
         self.assertTrue(self._call(lambda *a, **k: b"\x01\x00"))
 
+
+class I2cReplyTests(unittest.TestCase):
+    """A stale frame left in the adapter's FIFO must be skipped, not returned.
+
+    The adapter routinely still holds the previous frame (often a capability
+    chunk) when the reply to the current request is read.
+    """
+
+    def test_stale_frame_is_skipped(self) -> None:
+        from unittest import mock
+
+        from eyecareu.ddc.i2c import I2cDdcBackend
+
+        backend = I2cDdcBackend(retries=1)
+        stale = bytes([0x6E, 0x84, 0xE3, 0x00, 0x1A, 0x00])          # 0xE3 chunk
+        valid = bytes([0x6E, 0x88, 0x02, 0x00, 0xDC, 0x00, 0x04, 0x28, 0x00, 0x32])
+        frames = iter([stale, valid])
+        with mock.patch("eyecareu.ddc.i2c.os.set_blocking"), \
+                mock.patch("eyecareu.ddc.i2c.os.read",
+                           side_effect=lambda fd, n: next(frames)):
+            data = backend._read_reply(
+                99, 8,
+                lambda r: len(r) >= 3 and r[0] == 0x02 and r[2] == 0xDC)
+        self.assertEqual(data[2], 0xDC)
+        self.assertEqual((data[6] << 8) | data[7], 0x0032)
+
     def test_permission_error_is_reported(self) -> None:
         from eyecareu.ddc.base import DdcError, MonitorIdentity
         from eyecareu.ddc.i2c import I2cDdcBackend
@@ -615,24 +661,32 @@ class I2cSetVcpTests(unittest.TestCase):
 
 
 class ColorModeWriteTests(unittest.TestCase):
-    """``set_color_mode`` confirms via read-back and tries the BenQ sub ladder."""
+    """``set_color_mode`` writes full values and confirms via a retried read."""
 
     class FakeBackend:
         name = "fake"
 
-        def __init__(self, accepts: set[int]) -> None:
+        def __init__(self, accepts: set[int], stale_first: bool = False) -> None:
             self.accepts = set(accepts)
             self.writes: list[int] = []
             self.current = 0x0000
+            self.stale_first = stale_first
+            self._stale: int | None = None
 
         def get_vcp(self, monitor, vcp):
             from eyecareu.ddc.base import VcpValue
 
-            return VcpValue(vcp=vcp, current=self.current, maximum=0x0428,
+            current = self.current
+            if self._stale is not None:        # first read after a write lags
+                current = self._stale
+                self._stale = None
+            return VcpValue(vcp=vcp, current=current, maximum=0x0428,
                             supported=True)
 
         def set_vcp(self, monitor, vcp, value) -> bool:
             self.writes.append(value)
+            if self.stale_first and self._stale is None:
+                self._stale = self.current           # echo the *old* mode once
             if value in self.accepts:
                 self.current = value
             return True
@@ -643,31 +697,59 @@ class ColorModeWriteTests(unittest.TestCase):
         def close(self) -> None:
             pass
 
-    def _manager(self, accepts):
+    def setUp(self) -> None:
+        from unittest import mock
+
+        delay = mock.patch("eyecareu.ddc.manager.COLOR_MODE_CONFIRM_DELAY_S", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+
+    def _manager(self, accepts, stale_first: bool = False):
         from eyecareu.ddc.base import MonitorIdentity
         from eyecareu.ddc.manager import MonitorManager, MonitorState
 
-        backend = self.FakeBackend(accepts)
+        backend = self.FakeBackend(accepts, stale_first=stale_first)
         manager = MonitorManager(backend=backend)
         identity = MonitorIdentity(display_id="d0", i2c_bus=4, manufacturer="BNQ")
         manager._monitors["d0"] = MonitorState(identity=identity)
         return manager, backend
 
-    def test_mode_with_sub_zero(self) -> None:
-        manager, backend = self._manager({0x0028})
-        self.assertTrue(manager.set_color_mode("d0", 0x28))
-        self.assertEqual(backend.writes, [0x0028])
-        self.assertEqual(backend.current, 0x0028)
+    def test_full_value_written_verbatim(self) -> None:
+        # Cinema on a GW-series panel is 0x32 — stored as-is, not 0x03.
+        manager, backend = self._manager({0x0032})
+        self.assertTrue(manager.set_color_mode("d0", 0x0032))
+        self.assertEqual(backend.writes, [0x0032])
+        self.assertEqual(backend.current, 0x0032)
 
-    def test_coding_uses_non_zero_sub(self) -> None:
-        manager, backend = self._manager({0x0127})
+    def test_shcode_mode_written_verbatim(self) -> None:
+        # A full SHCode value (0x0227 = Coding) must not be re-laddered into a
+        # *different* mode the way the old low-byte matching did.
+        manager, backend = self._manager({0x0227})
+        self.assertTrue(manager.set_color_mode("d0", 0x0227))
+        self.assertEqual(backend.writes, [0x0227])
+        self.assertEqual(backend.current, 0x0227)
+
+    def test_bare_code_expands_to_full_values(self) -> None:
+        manager, backend = self._manager({0x0227})
         self.assertTrue(manager.set_color_mode("d0", 0x27))
-        self.assertEqual(backend.writes, [0x0027, 0x0127])
+        self.assertEqual(backend.writes, [0x0127, 0x0227])
+
+    def test_unknown_code_tries_shcode_ladder(self) -> None:
+        manager, backend = self._manager({0x0105})
+        self.assertTrue(manager.set_color_mode("d0", 0x05))
+        self.assertEqual(backend.writes, [0x0005, 0x0105])
 
     def test_rejected_mode_returns_false(self) -> None:
         manager, backend = self._manager(set())
-        self.assertFalse(manager.set_color_mode("d0", 0x03))
-        self.assertEqual(backend.writes, [0x0003, 0x0103, 0x0203])
+        self.assertFalse(manager.set_color_mode("d0", 0x0003))
+        self.assertEqual(backend.writes, [0x0003, 0x0103, 0x0203, 0x0403])
+
+    def test_stale_first_read_is_retried(self) -> None:
+        # The first read-back after a write often returns the *old* mode; the
+        # write must still be reported as successful.
+        manager, backend = self._manager({0x0032}, stale_first=True)
+        self.assertTrue(manager.set_color_mode("d0", 0x0032))
+        self.assertEqual(backend.current, 0x0032)
 
 
 class RegroupTests(unittest.TestCase):
