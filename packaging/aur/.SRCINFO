@@ -17,6 +17,6 @@ pkgbase = eyecareu
 	optdepends = xorg-xrandr: X11 colour (gamma ramp) support
 	optdepends = xprintidle: idle detection for the timers/reminders
 	source = https://github.com/enn-dee/eyecareu-linux/archive/refs/tags/v1.0.2.tar.gz
-	sha256sums = 4bddc2d2092f00ed1ca0fd35b88a2055c876133a1557c821e995a81a05dcdd45
+	sha256sums = e2db4361b38559d22e6f63b161990e37943d4d3ce6f156fa99e05bd10aa62217
 
 pkgname = eyecareu

@@ -25,7 +25,7 @@ optdepends=(
 )
 install="$pkgname.install"
 source=("$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('4bddc2d2092f00ed1ca0fd35b88a2055c876133a1557c821e995a81a05dcdd45')
+sha256sums=('e2db4361b38559d22e6f63b161990e37943d4d3ce6f156fa99e05bd10aa62217')
 
 prepare() {
     cd "eyecareu-linux-$pkgver"
