@@ -360,7 +360,7 @@ class I2cDdcBackend(DdcBackend):
                 monitor.i2c_bus, payload, expect_data=8,
                 validator=lambda r: (len(r) >= 3 and r[0] == 0x02
                                      and r[2] == vcp),
-                timeout=_ACK_TIMEOUT_S, hold=_RESYNC_HOLD_S, attempts=2,
+                timeout=_ACK_TIMEOUT_S, hold=_RESYNC_HOLD_S, attempts=1,
             )
         except DdcError:
             return None                  # silent display: no acknowledgement
