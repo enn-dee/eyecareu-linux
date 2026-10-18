@@ -347,7 +347,7 @@ class MonitorManager:
         :data:`eyecareu.mccs.MODEL_COLOR_MODES`).  Otherwise the panel's own
         ``DC(...)`` list is used, each code expanded to its full value.
         """
-        known = mccs.MODEL_COLOR_MODES.get(state.identity.model.upper())
+        known = mccs.model_color_modes(state.identity.model)
         if known:
             return [int(value) for value in known]
         return _supported_color_modes(capability_string)
@@ -520,30 +520,56 @@ class MonitorManager:
         vcp = self.vcp("color_mode", mccs.Vcp.COLOR_MODE)
 
         value = int(mode) & 0xFFFF
-        if value <= 0xFF:
-            candidates = list(mccs.expand_color_mode(value))
-            if candidates == [value]:
-                # Unknown code: some models need it in the high half.  (The
-                # GW2490 uses sub-codes 1/2/4, not a contiguous ladder.)
-                candidates = [(sub << 8) | value
-                              for sub in (0x00, 0x01, 0x02, 0x04)]
-        else:
-            candidates = [value]
+        candidates = self._mode_candidates(value)
 
         for candidate in candidates:
             try:
-                written = self._backend.set_vcp(state.identity, vcp, candidate)
+                # A panel that answers the write reports the value it actually
+                # applied, so a clamped or ignored mode is detected without
+                # waiting for a (lagging) read-back.
+                applied = self._backend.set_vcp_ack(state.identity, vcp,
+                                                    candidate)
             except DdcError:
                 continue
+            if applied is not None:
+                state.color_mode = VcpValue(
+                    vcp=vcp, current=applied,
+                    maximum=state.color_mode.maximum,
+                    vcp_type=state.color_mode.vcp_type, supported=True)
+                if applied == candidate:
+                    return True
+                continue                 # the panel clamped it to another mode
             confirmed = self._confirm_color_mode(state, vcp, candidate)
             if confirmed is True:
                 return True
-            if confirmed is None and written:
-                # No read-back channel on this display: trust the write.
-                state.color_mode.current = candidate
-                state.color_mode.supported = True
+            if confirmed is None:
+                # No acknowledgement and no read-back channel: trust the write.
+                state.color_mode = VcpValue(
+                    vcp=vcp, current=candidate,
+                    maximum=state.color_mode.maximum,
+                    vcp_type=state.color_mode.vcp_type, supported=True)
                 return True
         return False
+
+    @staticmethod
+    def _mode_candidates(value: int) -> list[int]:
+        """Expand a requested mode into the value(s) to actually write.
+
+        A value that is already complete — including a low-byte mode the table
+        knows, such as ``0x28`` (Game) or ``0x32`` (Cinema) — is written
+        verbatim.  Only a bare advertised code with no mapping is expanded
+        (the GW2490's ``27`` stands for three modes); an entirely unknown code
+        falls back to an SHCode ladder, because some models need it in the
+        high half.
+        """
+        if value > 0xFF:
+            return [value]
+        expanded = mccs.expand_color_mode(value)
+        if expanded != (value,):
+            return list(expanded)
+        if value in mccs.BENQ_COLOR_MODES:
+            return [value]
+        return [(sub << 8) | value for sub in (0x00, 0x01, 0x02, 0x04)]
 
     def _confirm_color_mode(self, state: MonitorState, vcp: int,
                             expected: int) -> bool | None:

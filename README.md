@@ -110,9 +110,14 @@ the three real modes behind `27` are:
 and its Cinema mode is `0x32` (which the string *omits*). Other named BenQ values
 in `eyecareu/mccs.py`: Standard `0x00`, Care Mode `0x01`, sRGB `0x0A`, M-book
 `0x0F`, User `0x12`, M-Photo `0x1E`, ePaper `0x1F`, HDR `0x23`, Game `0x28`,
-Dark/Light theme `0x30`/`0x31`, Cinema `0x32`. A write is confirmed by reading
-`0xDC` back (the first frame after a write is often stale, so it is retried), and
-a mode a panel does not accept is reported rather than silently ignored.
+Dark/Light theme `0x30`/`0x31`, Cinema `0x32`. A mode is written verbatim — a
+complete value is never "helpfully" re-expanded into a different one — and the
+panel's own acknowledgement is used to confirm it: a BenQ panel answers result
+`0x00` even for a mode it does not support, but echoes back the value it
+actually applied (`0x0003` comes back as `0x0000`), so a clamped write is
+reported as a failure instead of silently doing the wrong thing. Panels that
+never acknowledge a write fall back to reading `0xDC` back, retried because the
+first frame after a change is often stale.
 `tools/identify_color_modes.py` walks a panel through the candidate values so a
 new model's names can be recorded.
 
@@ -276,13 +281,16 @@ eyecareu/
   the bus never accumulates a backlog.
 * **Capability strings are cached** — in memory, and on disk under
   `~/.local/state/eyecareu/capabilities/`, keyed by the monitor's EDID. Reading
-  them is the most expensive DDC/CI conversation (and the flakiest: the i2c
-  adapter usually still holds the *previous* frame, so pending frames are drained
-  before each request and each chunk is offset-validated while stale frames are
-  skipped). The cache makes every start after the first instant; the
-  user-facing refresh re-reads the panel and replaces the cached copy. A
-  monitor whose link test or capability read fails is retried on a backoff, so
-  a transient bus error recovers on its own.
+  them is the most expensive DDC/CI conversation, and the flakiest: the common
+  `i2c-dev` adapters hand the reply back through a ~32-byte *circular* buffer, so
+  a frame rarely starts at offset 0, may wrap around the end, and is interleaved
+  with replayed bytes from earlier requests. A reply is therefore read window by
+  window and located by scanning every rotation for a frame whose checksum
+  verifies and whose contents (VCP code or capability offset) match the request —
+  a stale frame can never be mistaken for the answer. The cache makes every start
+  after the first instant; the user-facing refresh re-reads the panel and replaces
+  the cached copy. A monitor whose link test or capability read fails is retried
+  on a backoff, so a transient bus error recovers on its own.
 * **Software effects** are dispatched to the best backend for the session:
   * **Hyprland** — real, whole-screen colour temperature *and* dimming through
     the `hyprland-ctm-control-v1` protocol, driven by the `hyprsunset` daemon

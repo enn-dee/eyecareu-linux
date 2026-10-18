@@ -340,6 +340,10 @@ class ProbeAndPollTests(unittest.TestCase):
         def set_vcp(self, monitor, vcp, value) -> bool:
             return True
 
+        def set_vcp_ack(self, monitor, vcp, value):
+            self.set_vcp(monitor, vcp, value)
+            return None                  # panel does not acknowledge writes
+
         def get_capabilities(self, monitor) -> str:
             self.caps_reads += 1
             return self.caps
@@ -644,6 +648,35 @@ class I2cReplyTests(unittest.TestCase):
         self.assertEqual(data[2], 0xDC)
         self.assertEqual((data[6] << 8) | data[7], 0x0032)
 
+    def test_rotated_window_is_rescanned(self) -> None:
+        # The adapter hands back a circular window: the frame can begin at any
+        # offset, and one that crosses the end wraps around to the front.
+        from eyecareu.ddc.i2c import I2cDdcBackend
+
+        # 0xDC = 0x0032 (Cinema).  Display frames checksum to 0x50.
+        frame = bytes([0x6E, 0x88, 0x02, 0x00, 0xDC, 0x00, 0x04, 0x28,
+                       0x00, 0x32, 0x76])
+        window = bytearray(b"\x00" * 32)
+        window[27:32] = frame[:5]        # tail of the frame ...
+        window[0:6] = frame[5:]          # ... wrapping to the front
+
+        data = I2cDdcBackend._scan_frame(
+            bytes(window), 8,
+            lambda r: len(r) >= 3 and r[0] == 0x02 and r[2] == 0xDC)
+        self.assertIsNotNone(data)
+        self.assertEqual((data[6] << 8) | data[7], 0x0032)
+
+    def test_stale_frame_for_another_vcp_is_ignored(self) -> None:
+        from eyecareu.ddc.i2c import I2cDdcBackend
+
+        # A leftover brightness reply must not satisfy a picture-mode request.
+        stale = bytes([0x6E, 0x88, 0x02, 0x00, 0x10, 0x00, 0x00, 0x64,
+                       0x00, 0x62, 0xA2])
+        data = I2cDdcBackend._scan_frame(
+            stale + b"\x00" * (32 - len(stale)), 8,
+            lambda r: len(r) >= 3 and r[0] == 0x02 and r[2] == 0xDC)
+        self.assertIsNone(data)
+
     def test_permission_error_is_reported(self) -> None:
         from eyecareu.ddc.base import DdcError, MonitorIdentity
         from eyecareu.ddc.i2c import I2cDdcBackend
@@ -666,11 +699,13 @@ class ColorModeWriteTests(unittest.TestCase):
     class FakeBackend:
         name = "fake"
 
-        def __init__(self, accepts: set[int], stale_first: bool = False) -> None:
+        def __init__(self, accepts: set[int], stale_first: bool = False,
+                     acks: bool = False) -> None:
             self.accepts = set(accepts)
             self.writes: list[int] = []
             self.current = 0x0000
             self.stale_first = stale_first
+            self.acks = acks
             self._stale: int | None = None
 
         def get_vcp(self, monitor, vcp):
@@ -691,6 +726,13 @@ class ColorModeWriteTests(unittest.TestCase):
                 self.current = value
             return True
 
+        def set_vcp_ack(self, monitor, vcp, value):
+            """Mirror a real panel: None = silent, else the applied mode."""
+            self.set_vcp(monitor, vcp, value)
+            if not self.acks:
+                return None
+            return value if value in self.accepts else self.current
+
         def get_capabilities(self, monitor) -> str:
             return ""
 
@@ -704,11 +746,11 @@ class ColorModeWriteTests(unittest.TestCase):
         delay.start()
         self.addCleanup(delay.stop)
 
-    def _manager(self, accepts, stale_first: bool = False):
+    def _manager(self, accepts, stale_first: bool = False, acks: bool = False):
         from eyecareu.ddc.base import MonitorIdentity
         from eyecareu.ddc.manager import MonitorManager, MonitorState
 
-        backend = self.FakeBackend(accepts, stale_first=stale_first)
+        backend = self.FakeBackend(accepts, stale_first=stale_first, acks=acks)
         manager = MonitorManager(backend=backend)
         identity = MonitorIdentity(display_id="d0", i2c_bus=4, manufacturer="BNQ")
         manager._monitors["d0"] = MonitorState(identity=identity)
@@ -750,6 +792,25 @@ class ColorModeWriteTests(unittest.TestCase):
         manager, backend = self._manager({0x0032}, stale_first=True)
         self.assertTrue(manager.set_color_mode("d0", 0x0032))
         self.assertEqual(backend.current, 0x0032)
+
+    def test_known_low_byte_mode_is_not_laddered(self) -> None:
+        # 0x28 (Game) is a complete value, not a bare advertised code, so it
+        # must be written once instead of being tried as 0x0128/0x0228/0x0428.
+        manager, backend = self._manager({0x0028})
+        self.assertTrue(manager.set_color_mode("d0", 0x0028))
+        self.assertEqual(backend.writes, [0x0028])
+
+    def test_acknowledged_write_skips_read_back(self) -> None:
+        manager, backend = self._manager({0x0032}, acks=True)
+        self.assertTrue(manager.set_color_mode("d0", 0x0032))
+        self.assertEqual(backend.writes, [0x0032])
+
+    def test_acknowledged_clamp_is_reported_as_failure(self) -> None:
+        # A BenQ panel answers result 0x00 even for a mode it does not support
+        # but echoes the value it fell back to; that is not success.
+        manager, backend = self._manager({0x0032}, acks=True)
+        self.assertFalse(manager.set_color_mode("d0", 0x0003))
+        self.assertEqual(backend.writes, [0x0003, 0x0103, 0x0203, 0x0403])
 
 
 class RegroupTests(unittest.TestCase):

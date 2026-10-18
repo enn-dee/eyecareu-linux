@@ -193,6 +193,24 @@ DEFAULT_COLOR_MODES: tuple[int, ...] = (
 )
 
 
+def model_color_modes(model: str) -> tuple[int, ...] | None:
+    """Verified picture-mode values for an EDID *model*, if one is recorded.
+
+    The EDID model string usually carries the vendor name too ("BenQ GW2490"),
+    so a known model name contained in it also matches.
+    """
+    key = (model or "").strip().upper()
+    if not key:
+        return None
+    exact = MODEL_COLOR_MODES.get(key)
+    if exact is not None:
+        return exact
+    for name, modes in MODEL_COLOR_MODES.items():
+        if name in key:
+            return modes
+    return None
+
+
 def expand_color_mode(code: int) -> tuple[int, ...]:
     """Expand an advertised low-byte mode *code* into full 16-bit values.
 

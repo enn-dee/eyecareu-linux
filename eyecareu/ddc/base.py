@@ -69,6 +69,21 @@ class DdcBackend(abc.ABC):
     def set_vcp(self, monitor: MonitorIdentity, vcp: int, value: int) -> bool:
         """Write *value* to *vcp*; return True on success."""
 
+    def set_vcp_ack(self, monitor: MonitorIdentity, vcp: int,
+                    value: int) -> int | None:
+        """Write *value* to *vcp* and return the value the display reports.
+
+        Many displays never acknowledge a "Set VCP Feature"; those return
+        ``None``.  A display that *does* answer reports the value it actually
+        applied — which is how a clamped or ignored write is told apart from a
+        real success (a BenQ panel acknowledges even a mode it does not
+        support, but echoes a different value).  Raises :class:`DdcError` when
+        the display explicitly refuses the write or the bus fails.
+        """
+        if not self.set_vcp(monitor, vcp, value):
+            raise DdcError(f"display refused VCP 0x{vcp:02X} = 0x{value:04X}")
+        return None
+
     def get_capabilities(self, monitor: MonitorIdentity) -> str:
         """Return the raw MCCS capability string, or "" when unavailable."""
         return ""
