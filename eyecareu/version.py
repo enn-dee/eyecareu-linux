@@ -5,7 +5,7 @@ from __future__ import annotations
 __all__ = ["__version__", "WINDOWS_SOURCE_VERSION", "APP_NAME", "APP_ID", "ORG_NAME"]
 
 #: Version of this Linux port.
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 #: The Windows release this port reproduces.
 WINDOWS_SOURCE_VERSION = "1.5.5.0"
