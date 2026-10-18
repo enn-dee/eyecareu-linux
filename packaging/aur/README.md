@@ -35,5 +35,5 @@ The AUR is a separate git host, so this needs your own AUR account and SSH key:
 ```bash
 git clone ssh://aur@aur.archlinux.org/eyecareu.git aur-eyecareu
 cp PKGBUILD .SRCINFO eyecareu.install aur-eyecareu/
-cd aur-eyecareu && git add -A && git commit -m "eyecareu 1.0.1" && git push
+cd aur-eyecareu && git add -A && git commit -m "eyecareu 1.0.2" && git push
 ```

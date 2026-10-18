@@ -9,7 +9,7 @@
 #     updpkgsums                          # after changing pkgver
 #
 pkgname=eyecareu
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="Linux port of BenQ Eye-CareU: DDC/CI monitor control and software eye-care"
 arch=('any')
@@ -25,7 +25,7 @@ optdepends=(
 )
 install="$pkgname.install"
 source=("$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('1289bbc41ff6115dd3888769e6b5af7c36a9d8c247bb5b5df5fcdee3c5de6aa0')
+sha256sums=('4bddc2d2092f00ed1ca0fd35b88a2055c876133a1557c821e995a81a05dcdd45')
 
 prepare() {
     cd "eyecareu-linux-$pkgver"
