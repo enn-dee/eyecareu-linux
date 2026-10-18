@@ -40,17 +40,30 @@ DDC_SOURCE_DISPLAY = 0x6E
 # Delays required by the DDC/CI specification.
 _T_WRITE_READ_S = 0.045
 _T_RETRY_S = 0.050
-_DEFAULT_RETRIES = 4
+_DEFAULT_RETRIES = 6
 #: Size of a single DDC read.  The common ``i2c-dev`` adapters (amdgpu's
 #: ``AMDGPU DM`` buses in particular) hand back the reply through a ~32 byte
 #: circular buffer, so asking for more just repeats the same window.
 _READ_WINDOW = 32
 #: How long to scan one reply before re-issuing the request.  A display often
 #: answers the *next* request when the previous reply is still queued, so the
-#: caller retries rather than waiting on one very long window.
-_REPLY_TIMEOUT_S = 0.30
+#: caller retries rather than waiting on one very long window.  Measured to be
+#: the sweet spot: a longer window wastes time on the stale frames replaying
+#: from the adapter, a shorter one spends its budget waiting for a reply that
+#: is still on the wire.
+_REPLY_TIMEOUT_S = 0.18
 #: Many displays send no reply at all to a "Set VCP Feature"; wait only briefly.
 _SET_REPLY_TIMEOUT_S = 0.20
+#: A reply that only appears at least this long after a request is the panel's
+#: answer; anything available sooner is the adapter replaying an older transfer.
+_FRESH_AFTER_S = 0.35
+#: How long to keep looking for a newer frame when one was already buffered.
+#: This class of panel can need well over a second to answer after a write, so
+#: the window has to be generous — but a *changed* value returns the moment it
+#: appears, so the full window is only ever paid when nothing changed.
+_RESYNC_HOLD_S = 1.50
+#: Budget for an acknowledged write (hold window plus margin for the wire).
+_ACK_TIMEOUT_S = _RESYNC_HOLD_S + _FRESH_AFTER_S
 
 
 def _checksum(packet: bytes) -> int:
@@ -142,22 +155,36 @@ class I2cDdcBackend(DdcBackend):
         return fallback
 
     def _read_reply(self, fd: int, expect_data: int, validator=None,
-                    timeout: float = _REPLY_TIMEOUT_S) -> bytes:
-        """Return the first DDC reply frame that passes *validator*.
+                    timeout: float = _REPLY_TIMEOUT_S,
+                    hold: float = 0.0) -> bytes:
+        """Return the DDC reply frame that answers the current request.
 
         A single ``read()`` cannot be used, because the reply arrives through
         a circular buffer that
 
         * usually does not start at the frame boundary (and wraps), and
-        * keeps replaying content from *earlier* traffic — typically capability
-          chunks — so the first frames seen often answer a previous request.
+        * keeps replaying the previous transfer until the panel has answered
+          the current request.
 
         Windows are therefore read one at a time and scanned for a frame that
         passes *validator* (which pins the VCP code or the capability offset,
-        so a stale frame can never be mistaken for the reply) until *timeout*
-        elapses.
+        so a frame for another request is never accepted).
+
+        *hold* additionally defeats the replay.  A frame that only appears at
+        least :data:`_FRESH_AFTER_S` after the request was written is the
+        panel's answer and is returned immediately.  One that is available
+        straight away is a leftover, so a newer frame with a different value
+        supersedes it; if none turns up within *hold* the leftover is returned
+        anyway (the value simply did not change).  Reads that do not care about
+        a specific value — a capability chunk, whose offset *validator* already
+        pins — leave *hold* at zero and stay fast.
         """
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        if hold:
+            timeout = max(timeout, hold + _FRESH_AFTER_S)
+        deadline = started + timeout
+        best: bytes | None = None
+        release_at = 0.0
         try:
             os.set_blocking(fd, False)
         except OSError as exc:
@@ -170,11 +197,22 @@ class I2cDdcBackend(DdcBackend):
                     raw = b""
                 except OSError as exc:
                     raise DdcError(f"i2c read failed: {exc}") from exc
+                now = time.monotonic()
                 if len(raw) >= 3:
                     data = self._scan_frame(raw, expect_data, validator)
                     if data is not None:
-                        return data
-                if time.monotonic() >= deadline:
+                        if best is None:
+                            best = data
+                            if not hold or now - started >= _FRESH_AFTER_S:
+                                return data
+                            release_at = now + hold
+                        elif data != best:
+                            return data            # a newer answer wins
+                        elif now >= release_at:
+                            return best
+                if now >= deadline:
+                    if best is not None:
+                        return best
                     raise DdcError("no valid DDC reply")
                 time.sleep(0.004)
         finally:
@@ -184,10 +222,11 @@ class I2cDdcBackend(DdcBackend):
                 pass
 
     def _transact(self, bus: int, data: bytes, expect_data: int,
-                  validator=None, timeout: float = _REPLY_TIMEOUT_S) -> bytes:
+                  validator=None, timeout: float = _REPLY_TIMEOUT_S,
+                  hold: float = 0.0, attempts: int | None = None) -> bytes:
         node = self._device_node(bus)
         last_error: Exception | None = None
-        for attempt in range(self._retries):
+        for attempt in range(attempts or self._retries):
             fd = -1
             try:
                 fd = self._open_bus(bus)
@@ -198,7 +237,8 @@ class I2cDdcBackend(DdcBackend):
                 # Displays occasionally emit a stale frame (e.g. leftover
                 # capability bytes) *after* a request; _read_reply skips those
                 # rather than returning a plausible-looking wrong value.
-                return self._read_reply(fd, expect_data, validator, timeout)
+                return self._read_reply(fd, expect_data, validator, timeout,
+                                        hold)
             except OSError as exc:
                 last_error = exc
                 if exc.errno in (errno.EBUSY, errno.EIO, errno.EAGAIN):
@@ -229,12 +269,22 @@ class I2cDdcBackend(DdcBackend):
 
     # -- DdcBackend --------------------------------------------------------
     def get_vcp(self, monitor: MonitorIdentity, vcp: int) -> VcpValue:
+        """Read *vcp* quickly, taking the first matching frame."""
+        return self._get_vcp(monitor, vcp, hold=0.0)
+
+    def get_vcp_settled(self, monitor: MonitorIdentity, vcp: int) -> VcpValue:
+        """Read *vcp*, holding back a frame the adapter is replaying."""
+        return self._get_vcp(monitor, vcp, hold=_RESYNC_HOLD_S)
+
+    def _get_vcp(self, monitor: MonitorIdentity, vcp: int,
+                 hold: float) -> VcpValue:
         if monitor.i2c_bus is None:
             return VcpValue(vcp=vcp, error="no i2c bus for display")
         try:
             data = self._transact(
                 monitor.i2c_bus, bytes([0x01, vcp]), expect_data=8,
                 validator=lambda r: len(r) >= 3 and r[0] == 0x02 and r[2] == vcp,
+                hold=hold, attempts=2 if hold else None,
             )
         except DdcError as exc:
             return VcpValue(vcp=vcp, error=str(exc))
@@ -310,7 +360,7 @@ class I2cDdcBackend(DdcBackend):
                 monitor.i2c_bus, payload, expect_data=8,
                 validator=lambda r: (len(r) >= 3 and r[0] == 0x02
                                      and r[2] == vcp),
-                timeout=_SET_REPLY_TIMEOUT_S,
+                timeout=_ACK_TIMEOUT_S, hold=_RESYNC_HOLD_S, attempts=2,
             )
         except DdcError:
             return None                  # silent display: no acknowledgement

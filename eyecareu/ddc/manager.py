@@ -31,13 +31,16 @@ OFFLINE_RETRY_SECONDS = 8.0
 CAPABILITY_ATTEMPTS = 3
 #: Sentinel for "this display is fully probed and needs no further retry".
 NO_RETRY = float("inf")
-#: How many times to re-read VCP 0xDC before trusting a write.  The first read
-#: after a write is frequently a stale frame (the adapter still holds the mode
-#: from *before* the change), and some panels take a second or two to reflect a
-#: switch, so a single read-back is not reliable.
-COLOR_MODE_CONFIRM_READS = 5
+#: How many times to re-read VCP 0xDC before trusting a write.  The read is the
+#: replay-proof :meth:`get_vcp_settled`, so few are needed: the first one waits
+#: out the stale frame, and the second covers a panel that was still switching.
+COLOR_MODE_CONFIRM_READS = 2
 #: Delay between those confirming reads.
-COLOR_MODE_CONFIRM_DELAY_S = 0.20
+COLOR_MODE_CONFIRM_DELAY_S = 0.15
+#: How many times to issue a picture-mode write.  A second attempt covers the
+#: rare case where the acknowledgement *and* the read-back both came from the
+#: adapter's replay of the previous mode.
+COLOR_MODE_WRITE_ATTEMPTS = 2
 
 
 @dataclass(slots=True)
@@ -300,6 +303,17 @@ class MonitorManager:
             state.probed = True
             return
 
+        # Publish the picture-mode selector as soon as the link is up.  The
+        # capability read and the per-value reads that follow cost seconds on a
+        # slow bus, and the Display page should not sit empty until they finish.
+        # A verified per-model list is not a guess, so showing it here is safe.
+        early_modes = mccs.model_color_modes(state.identity.model)
+        if early_modes:
+            state.color_modes = [int(value) for value in early_modes]
+            state.capabilities.capabilities.add("color_mode")
+            if on_update is not None:
+                on_update()
+
         capabilities = self._capabilities.get(state.identity.display_id)
         if capabilities is None or reload_capabilities:
             capabilities = None
@@ -521,35 +535,52 @@ class MonitorManager:
 
         value = int(mode) & 0xFFFF
         candidates = self._mode_candidates(value)
+        #: The mode the panel was in before this call: if a read-back comes
+        #: back reporting *that*, the adapter may still be replaying the old
+        #: answer rather than reporting a clamp.
+        before = state.color_mode.current
+        # Only a single-candidate write is retried: that is a complete value the
+        # selector offered, so a replay-induced false negative would be a real
+        # bug for the user.  A ladder of guesses is left alone — it is already
+        # probing, and re-writing each rung would just double its cost.
+        attempts = COLOR_MODE_WRITE_ATTEMPTS if len(candidates) == 1 else 1
 
         for candidate in candidates:
-            try:
-                # A panel that answers the write reports the value it actually
-                # applied, so a clamped or ignored mode is detected without
-                # waiting for a (lagging) read-back.
-                applied = self._backend.set_vcp_ack(state.identity, vcp,
-                                                    candidate)
-            except DdcError:
-                continue
-            if applied is not None:
-                state.color_mode = VcpValue(
-                    vcp=vcp, current=applied,
-                    maximum=state.color_mode.maximum,
-                    vcp_type=state.color_mode.vcp_type, supported=True)
+            for _ in range(attempts):
+                applied: int | None = None
+                try:
+                    # A panel that answers the write reports the value it
+                    # actually applied, which is the fast confirmation.
+                    applied = self._backend.set_vcp_ack(
+                        state.identity, vcp, candidate)
+                except DdcError:
+                    pass
                 if applied == candidate:
+                    state.color_mode = self._mode_value(state, vcp, candidate)
                     return True
-                continue                 # the panel clamped it to another mode
-            confirmed = self._confirm_color_mode(state, vcp, candidate)
-            if confirmed is True:
-                return True
-            if confirmed is None:
-                # No acknowledgement and no read-back channel: trust the write.
-                state.color_mode = VcpValue(
-                    vcp=vcp, current=candidate,
-                    maximum=state.color_mode.maximum,
-                    vcp_type=state.color_mode.vcp_type, supported=True)
-                return True
+                confirmed = self._confirm_color_mode(state, vcp, candidate)
+                if confirmed is True:
+                    return True
+                if confirmed is None and applied is None:
+                    # No acknowledgement and no usable read-back channel:
+                    # trust the write rather than inventing a failure.
+                    state.color_mode = self._mode_value(state, vcp, candidate)
+                    return True
+                # The panel reported a different mode.  If it moved somewhere
+                # other than where it started from the write was genuinely
+                # clamped and re-writing would only waste time; if it *is*
+                # still reporting the old mode, write once more in case the
+                # answer was a replayed frame.
+                if state.color_mode.current != before:
+                    break
         return False
+
+    @staticmethod
+    def _mode_value(state: MonitorState, vcp: int, value: int) -> VcpValue:
+        """Synthetic live reading for a picture mode just written."""
+        return VcpValue(vcp=vcp, current=int(value) & 0xFFFF,
+                        maximum=state.color_mode.maximum,
+                        vcp_type=state.color_mode.vcp_type, supported=True)
 
     @staticmethod
     def _mode_candidates(value: int) -> list[int]:
@@ -575,12 +606,15 @@ class MonitorManager:
                             expected: int) -> bool | None:
         """Read VCP 0xDC back until it matches *expected*.
 
+        Uses the replay-proof read, so the stale frame the adapter still holds
+        from before the write cannot make a real switch look like a failure.
+
         Returns True on a match, False when the panel reported a different mode,
         and None when the display gave no usable read-back at all.
         """
         last: VcpValue | None = None
         for _ in range(COLOR_MODE_CONFIRM_READS):
-            fresh = self._backend.get_vcp(state.identity, vcp)
+            fresh = self._backend.get_vcp_settled(state.identity, vcp)
             if fresh.supported:
                 last = fresh
                 if fresh.current == expected:

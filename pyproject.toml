@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eyecareu"
-version = "1.0.1"
+version = "1.0.2"
 description = "Linux port of BenQ Eye-CareU: DDC/CI monitor control and software eye-care"
 readme = "README.md"
 requires-python = ">=3.10"

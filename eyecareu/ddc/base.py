@@ -69,6 +69,17 @@ class DdcBackend(abc.ABC):
     def set_vcp(self, monitor: MonitorIdentity, vcp: int, value: int) -> bool:
         """Write *value* to *vcp*; return True on success."""
 
+    def get_vcp_settled(self, monitor: MonitorIdentity, vcp: int) -> VcpValue:
+        """Read *vcp*, waiting out a display that replays an older answer.
+
+        Right after a write the adapter can still hand back the *previous*
+        reply, so :meth:`get_vcp` may briefly report the value from before.
+        This variant keeps looking until the answer settles, which is what a
+        confirmation needs.  The default is a plain read; backends whose
+        adapter has the replay problem override it.
+        """
+        return self.get_vcp(monitor, vcp)
+
     def set_vcp_ack(self, monitor: MonitorIdentity, vcp: int,
                     value: int) -> int | None:
         """Write *value* to *vcp* and return the value the display reports.

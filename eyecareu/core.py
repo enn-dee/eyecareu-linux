@@ -264,11 +264,14 @@ class EyeCareCore(QObject):
         ``{"value": <full 16-bit int>, "label": <str>}``.
         """
         state = self._manager.monitor(self._selected)
-        if state is None or not state.probed:
-            # Still scanning: offering a guess here would just flicker.
+        if state is None:
             return []
-        codes = list(state.color_modes) if state.color_modes else []
+        codes = list(state.color_modes)
         if not codes:
+            if not state.probed:
+                # Still scanning, and there is nothing verified to show yet:
+                # offering a guess here would just flicker.
+                return []
             codes = list(mccs.DEFAULT_COLOR_MODES)
         return [{"value": int(code), "label": mccs.color_mode_name(code)}
                 for code in codes]

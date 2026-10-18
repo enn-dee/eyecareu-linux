@@ -340,6 +340,9 @@ class ProbeAndPollTests(unittest.TestCase):
         def set_vcp(self, monitor, vcp, value) -> bool:
             return True
 
+        def get_vcp_settled(self, monitor, vcp):
+            return self.get_vcp(monitor, vcp)
+
         def set_vcp_ack(self, monitor, vcp, value):
             self.set_vcp(monitor, vcp, value)
             return None                  # panel does not acknowledge writes
@@ -440,15 +443,22 @@ class ProbeAndPollTests(unittest.TestCase):
 
         backend = self.FakeBackend(caps=self.CAPS)
         manager = MonitorManager(backend=backend)
-        marks: list[int] = []
+        seen: list[tuple[int, list[int]]] = []
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch("eyecareu.ddc.capcache.state_dir",
                            return_value=Path(tmp)), \
                 mock.patch("eyecareu.ddc.manager.discover_monitors",
                            return_value=[self._identity()]):
-            manager.refresh(on_update=lambda: marks.append(1))
-        # The monitor is published (on_update) before the slow capability read.
-        self.assertEqual(marks, [1])
+            manager.refresh(on_update=lambda: seen.append(
+                (backend.caps_reads,
+                 list(manager.monitor("card1-HDMI-A-1").color_modes))))
+        # A progress callback fires before the slow capability read, and the
+        # verified per-model mode list is already published by then, so the
+        # Display page is usable without waiting for the capability string.
+        early = [modes for reads, modes in seen if reads == 0]
+        self.assertTrue(early)
+        # Cinema comes from the GW2490 table, not from the capability string.
+        self.assertTrue(any(0x0032 in modes for modes in early))
 
     def test_offline_monitor_recovers_on_later_poll(self) -> None:
         from unittest import mock
@@ -700,12 +710,17 @@ class ColorModeWriteTests(unittest.TestCase):
         name = "fake"
 
         def __init__(self, accepts: set[int], stale_first: bool = False,
-                     acks: bool = False) -> None:
+                     acks: bool = False, defer_writes: bool = False,
+                     clamp_to: int | None = None) -> None:
             self.accepts = set(accepts)
             self.writes: list[int] = []
             self.current = 0x0000
             self.stale_first = stale_first
             self.acks = acks
+            self.defer_writes = defer_writes
+            self.clamp_to = clamp_to
+            self._deferred = False
+            self._just_deferred = False
             self._stale: int | None = None
 
         def get_vcp(self, monitor, vcp):
@@ -718,12 +733,23 @@ class ColorModeWriteTests(unittest.TestCase):
             return VcpValue(vcp=vcp, current=current, maximum=0x0428,
                             supported=True)
 
+        def get_vcp_settled(self, monitor, vcp):
+            return self.get_vcp(monitor, vcp)
+
         def set_vcp(self, monitor, vcp, value) -> bool:
             self.writes.append(value)
             if self.stale_first and self._stale is None:
                 self._stale = self.current           # echo the *old* mode once
+            self._just_deferred = False
+            if self.defer_writes and not self._deferred:
+                # The adapter is still replaying the previous answer.
+                self._deferred = True
+                self._just_deferred = True
+                return True
             if value in self.accepts:
                 self.current = value
+            elif self.clamp_to is not None:
+                self.current = self.clamp_to
             return True
 
         def set_vcp_ack(self, monitor, vcp, value):
@@ -731,6 +757,8 @@ class ColorModeWriteTests(unittest.TestCase):
             self.set_vcp(monitor, vcp, value)
             if not self.acks:
                 return None
+            if self._just_deferred:
+                return self.current          # replayed: still the old mode
             return value if value in self.accepts else self.current
 
         def get_capabilities(self, monitor) -> str:
@@ -746,11 +774,14 @@ class ColorModeWriteTests(unittest.TestCase):
         delay.start()
         self.addCleanup(delay.stop)
 
-    def _manager(self, accepts, stale_first: bool = False, acks: bool = False):
+    def _manager(self, accepts, stale_first: bool = False, acks: bool = False,
+                 defer_writes: bool = False, clamp_to: int | None = None):
         from eyecareu.ddc.base import MonitorIdentity
         from eyecareu.ddc.manager import MonitorManager, MonitorState
 
-        backend = self.FakeBackend(accepts, stale_first=stale_first, acks=acks)
+        backend = self.FakeBackend(accepts, stale_first=stale_first,
+                                   acks=acks, defer_writes=defer_writes,
+                                   clamp_to=clamp_to)
         manager = MonitorManager(backend=backend)
         identity = MonitorIdentity(display_id="d0", i2c_bus=4, manufacturer="BNQ")
         manager._monitors["d0"] = MonitorState(identity=identity)
@@ -811,6 +842,21 @@ class ColorModeWriteTests(unittest.TestCase):
         manager, backend = self._manager({0x0032}, acks=True)
         self.assertFalse(manager.set_color_mode("d0", 0x0003))
         self.assertEqual(backend.writes, [0x0003, 0x0103, 0x0203, 0x0403])
+
+    def test_replayed_acknowledgement_is_written_again(self) -> None:
+        # The adapter can answer a write with the *previous* mode — and then
+        # keep replaying it for the read-back too.  Rather than reporting a
+        # failure the write is issued once more.
+        manager, backend = self._manager({0x0032}, acks=True, defer_writes=True)
+        self.assertTrue(manager.set_color_mode("d0", 0x0032))
+        self.assertEqual(backend.writes, [0x0032, 0x0032])
+        self.assertEqual(backend.current, 0x0032)
+
+    def test_clamped_single_value_is_not_rewritten(self) -> None:
+        # A genuine clamp to a *different* mode is not retried.
+        manager, backend = self._manager(set(), acks=True, clamp_to=0x0012)
+        self.assertFalse(manager.set_color_mode("d0", 0x0032))
+        self.assertEqual(backend.writes, [0x0032])
 
 
 class RegroupTests(unittest.TestCase):

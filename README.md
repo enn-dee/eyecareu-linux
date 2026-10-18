@@ -116,10 +116,20 @@ panel's own acknowledgement is used to confirm it: a BenQ panel answers result
 `0x00` even for a mode it does not support, but echoes back the value it
 actually applied (`0x0003` comes back as `0x0000`), so a clamped write is
 reported as a failure instead of silently doing the wrong thing. Panels that
-never acknowledge a write fall back to reading `0xDC` back, retried because the
-first frame after a change is often stale.
+never acknowledge a write fall back to reading `0xDC` back.
 `tools/identify_color_modes.py` walks a panel through the candidate values so a
 new model's names can be recorded.
+
+A picture-mode switch is confirmed against a *replay-proof* read. The adapter
+keeps handing back the previous transfer until the panel has answered the
+current request, so a confirmation taken at face value can report the mode from
+before the write. Reads used for confirmation therefore wait until the answer
+settles — a frame that only arrives after the request has had time to be
+answered is the reply, while one already buffered is held back — which is why
+the mode list and the highlighted button do not disagree with the panel. The
+selector itself is published as soon as the link test passes, from the verified
+per-model list, so the Display page is usable in well under a second instead of
+waiting for the capability read and the per-value reads that follow it.
 
 Contrast (`0x12`) and the remaining MCCS codes in `eyecareu/mccs.py` are
 standard-convention defaults, **not** observed BenQ behaviour. The BenQ vendor

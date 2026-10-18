@@ -10,6 +10,36 @@ Flickable {
     contentHeight: column.implicitHeight + Theme.pad * 2
     clip: true
 
+    //: Picture mode the user just picked, highlighted straight away.  The panel
+    //: needs about a second to switch, so waiting for the read-back before
+    //: moving the highlight makes every click feel laggy.
+    property int pendingMode: -1
+    readonly property int shownMode: pendingMode >= 0 ? pendingMode
+                                                      : core.selectedMonitor.colorMode
+
+    // Drop the optimistic highlight once the display reports the new mode ...
+    Connections {
+        target: core
+        function onMonitorsChanged() {
+            if (page.pendingMode >= 0
+                    && core.selectedMonitor.colorMode === page.pendingMode)
+                page.pendingMode = -1
+        }
+        // ... or as soon as a failure is reported, so a refused mode does not
+        // keep looking selected.
+        function onStatusMessageChanged() {
+            if (core.statusMessage !== "")
+                page.pendingMode = -1
+        }
+    }
+
+    // ... or if the write never reports back at all.
+    Timer {
+        interval: 6000
+        running: page.pendingMode >= 0
+        onTriggered: page.pendingMode = -1
+    }
+
     ScrollBar.vertical: ScrollBar {}
 
     ColumnLayout {
@@ -101,7 +131,7 @@ Flickable {
                     Rectangle {
                         id: modeButton
                         required property var modelData
-                        readonly property bool active: core.selectedMonitor.colorMode === modelData.value
+                        readonly property bool active: page.shownMode === modelData.value
                         width: modeText.implicitWidth + 26
                         height: 34
                         radius: Theme.radiusSmall
@@ -120,7 +150,11 @@ Flickable {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: core.setColorMode(core.selectedDisplayId, modelData.value)
+                            onClicked: {
+                                page.pendingMode = modelData.value
+                                core.setColorMode(core.selectedDisplayId,
+                                                  modelData.value)
+                            }
                         }
                     }
                 }
@@ -128,7 +162,7 @@ Flickable {
 
             Text {
                 visible: core.selectedMonitor.colorModeSupported === true
-                         && core.selectedMonitor.probed !== true
+                         && core.pictureModes.length === 0
                 text: "Reading the picture-mode list from the display\u2026"
                 color: Theme.textDim
                 font.pixelSize: Theme.fontSmall
